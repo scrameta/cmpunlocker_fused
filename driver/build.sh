@@ -68,7 +68,16 @@ for name in "${PATCH_ORDER[@]}"; do
     [[ -f "${p}" ]] || die "Missing patch: ${p}"
     PATCH_FILES+=("${p}")
 done
-PATCH_HASH="$(cat "${PATCH_FILES[@]}" | sha256sum | cut -d' ' -f1)"
+COMPAT_PATCHES=(
+    cxl-structs.patch
+)
+COMPAT_PATCH_FILES=()
+for name in "${COMPAT_PATCHES[@]}"; do
+    p="${PATCH_DIR}/${name}"
+    [[ -f "${p}" ]] || die "Missing compat patch: ${p}"
+    COMPAT_PATCH_FILES+=("${p}")
+done
+PATCH_HASH="$(cat "${PATCH_FILES[@]}" "${COMPAT_PATCH_FILES[@]}" | sha256sum | cut -d' ' -f1)"
 
 PROFILE="${CMPUNLOCKER_CARD_PROFILE:-8gb}"
 case "${PROFILE}" in
@@ -116,6 +125,23 @@ else
     for i in "${!PATCH_ORDER[@]}"; do
         info "  ${PATCH_ORDER[$i]}"
         patch -p1 < "${PATCH_FILES[$i]}"
+    done
+    for i in "${!COMPAT_PATCHES[@]}"; do
+        name="${COMPAT_PATCHES[$i]}"
+        case "${name}" in
+            cxl-structs.patch)
+                nv_linux="${SRC_DIR}/kernel-open/common/inc/nv-linux.h"
+                if [[ -f "${nv_linux}" ]] \
+                    && grep -q 'NV_CXL_CXL_H_PRESENT' "${nv_linux}" \
+                    && ! grep -q 'NV_CXL_STRUCTS_PRESENT' "${nv_linux}"; then
+                    info "  ${name} (kernel 7.0+ CXL structs conftest)"
+                    patch -p1 < "${COMPAT_PATCH_FILES[$i]}"
+                fi
+                ;;
+            *)
+                die "Unknown compat patch: ${name}"
+                ;;
+        esac
     done
     ok "All patches applied"
 
