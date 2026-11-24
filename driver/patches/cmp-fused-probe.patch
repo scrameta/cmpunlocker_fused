@@ -1,0 +1,756 @@
+--- a/kernel-open/nvidia/nv-pci.c
++++ b/kernel-open/nvidia/nv-pci.c
+@@ -36,6 +36,744 @@
+ #include <linux/jiffies.h>
+ #include <linux/kernel.h>
+ #include <linux/workqueue.h>
++#include <linux/delay.h>
++#include <linux/moduleparam.h>
++
++/*
++ * CMP 170HX fused/RIR/glitched runtime unlock options and probe-time handler.
++ *
++ * All options default to conservative stock cmpunlocker behavior:
++ *   - 64 GB (0x20C2) / 40 GB (0x2082) VRAM
++ *   - 74 SMs (or whatever permanent FF fuses already enable)
++ *   - PCIe Gen2
++ *   - Auto BAR1 (64 GB for <=64 GB VRAM, 128 GB for >64 GB VRAM)
++ *
++ * Set cmp_auto=1 to automatically enable every supported feature allowed by
++ * each card's live fuses, non-defective floorplan, and host PCIe root port,
++ * or toggle features individually. Zero OTP fuse writes are ever issued.
++ */
++int cmp_auto = 0;
++int cmp_unlock_vram = -1;
++int cmp_unlock_sm = -1;
++int cmp_max_pcie_gen = -1;
++int cmp_pcie_retrain = 1;
++int cmp_bar1_gb = 0;
++int cmp_magicd_a100 = 0;
++char *cmp_bdf = "";
++
++module_param(cmp_auto, int, 0444);
++MODULE_PARM_DESC(cmp_auto,
++    "CMP 170HX: auto-enable VRAM/SM/PCIe unlocks allowed by each card's fuses and floorplan (0=conservative default, 1=auto)");
++module_param(cmp_unlock_vram, int, 0444);
++MODULE_PARM_DESC(cmp_unlock_vram,
++    "CMP 170HX: extended VRAM above 64G/40G from active FBPs (-1=follow cmp_auto, 0=cap 64G/40G, 1=enable 80G/96G/48G)");
++module_param(cmp_unlock_sm, int, 0444);
++MODULE_PARM_DESC(cmp_unlock_sm,
++    "CMP 170HX: volatile SM unlock on DSOV=0 cards (-1=follow cmp_auto, 0=off, 1=SW-IFF+FLR full non-defective SMs, 2=SW-IFF or late TPC-only ~80 SMs)");
++module_param(cmp_max_pcie_gen, int, 0444);
++MODULE_PARM_DESC(cmp_max_pcie_gen,
++    "CMP 170HX: max PCIe generation target (-1=follow cmp_auto [2 or 4], 2=Gen2, 3=up to Gen3, 4=up to Gen4)");
++module_param(cmp_pcie_retrain, int, 0444);
++MODULE_PARM_DESC(cmp_pcie_retrain,
++    "CMP 170HX: automatic single-shot PCIe link retrain at init (1=enabled default, 0=disabled)");
++module_param(cmp_bar1_gb, int, 0444);
++MODULE_PARM_DESC(cmp_bar1_gb,
++    "CMP 170HX: BAR1 resize target in GiB (0=auto [64G for <=64G VRAM, 128G for >64G], 64=64G, 128=128G)");
++module_param(cmp_magicd_a100, int, 0444);
++MODULE_PARM_DESC(cmp_magicd_a100,
++    "CMP 170HX: also clear extra A100 parity bits 0x14480000 in PCIE_MAGIC_BITS_D on Gen4 SW override (0=bit25 only default, 1=A100 parity)");
++module_param(cmp_bdf, charp, 0444);
++MODULE_PARM_DESC(cmp_bdf,
++    "CMP 170HX: comma-separated PCI BDF filter for advanced unlocks, e.g. 0000:01:00.0 (empty=all CMP 170HX GPUs)");
++
++int cmp170hx_bdf_matches(unsigned int domain, unsigned int bus,
++                         unsigned int dev, unsigned int fn);
++int cmp170hx_want_unlock_vram(unsigned int domain, unsigned int bus,
++                              unsigned int dev, unsigned int fn);
++int cmp170hx_want_unlock_sm(unsigned int domain, unsigned int bus,
++                            unsigned int dev, unsigned int fn);
++int cmp170hx_want_max_pcie_gen(unsigned int domain, unsigned int bus,
++                               unsigned int dev, unsigned int fn);
++int cmp170hx_want_pcie_retrain(void);
++int cmp170hx_want_bar1_gb(void);
++int cmp170hx_want_magicd_a100(void);
++
++int cmp170hx_bdf_matches(unsigned int domain, unsigned int bus,
++                         unsigned int dev, unsigned int fn)
++{
++    char full_bdf[20];
++    char short_bdf[12];
++    const char *p, *comma;
++    size_t len, full_len, short_len;
++
++    if ((cmp_bdf == NULL) || (cmp_bdf[0] == '\0'))
++        return 1;
++
++    snprintf(full_bdf, sizeof(full_bdf), "%04x:%02x:%02x.%x",
++             domain & 0xffffU, bus & 0xffU, dev & 0x1fU, fn & 0x7U);
++    snprintf(short_bdf, sizeof(short_bdf), "%02x:%02x.%x",
++             bus & 0xffU, dev & 0x1fU, fn & 0x7U);
++    full_len = strlen(full_bdf);
++    short_len = strlen(short_bdf);
++
++    p = cmp_bdf;
++    while (*p != '\0')
++    {
++        while ((*p == ' ') || (*p == '\t') || (*p == ','))
++            p++;
++        if (*p == '\0')
++            break;
++        comma = strchr(p, ',');
++        len = (comma != NULL) ? (size_t)(comma - p) : strlen(p);
++        while ((len > 0) && ((p[len - 1] == ' ') || (p[len - 1] == '\t')))
++            len--;
++        if (((len == full_len) && (strncasecmp(p, full_bdf, len) == 0)) ||
++            ((len == short_len) && (strncasecmp(p, short_bdf, len) == 0)))
++            return 1;
++        if (comma == NULL)
++            break;
++        p = comma + 1;
++    }
++    return 0;
++}
++
++int cmp170hx_want_unlock_vram(unsigned int domain, unsigned int bus,
++                              unsigned int dev, unsigned int fn)
++{
++    if (!cmp170hx_bdf_matches(domain, bus, dev, fn))
++        return 0;
++    if (cmp_unlock_vram >= 0)
++        return (cmp_unlock_vram != 0) ? 1 : 0;
++    return (cmp_auto != 0) ? 1 : 0;
++}
++
++int cmp170hx_want_unlock_sm(unsigned int domain, unsigned int bus,
++                            unsigned int dev, unsigned int fn)
++{
++    if (!cmp170hx_bdf_matches(domain, bus, dev, fn))
++        return 0;
++    if (cmp_unlock_sm >= 0)
++        return cmp_unlock_sm;
++    return (cmp_auto != 0) ? 1 : 0;
++}
++
++int cmp170hx_want_max_pcie_gen(unsigned int domain, unsigned int bus,
++                               unsigned int dev, unsigned int fn)
++{
++    int gen;
++
++    if (!cmp170hx_bdf_matches(domain, bus, dev, fn))
++        return 2;
++    if (cmp_max_pcie_gen >= 0)
++        gen = cmp_max_pcie_gen;
++    else
++        gen = (cmp_auto != 0) ? 4 : 2;
++    if (gen < 2)
++        gen = 2;
++    if (gen > 4)
++        gen = 4;
++    return gen;
++}
++
++int cmp170hx_want_pcie_retrain(void)
++{
++    return (cmp_pcie_retrain != 0) ? 1 : 0;
++}
++
++int cmp170hx_want_bar1_gb(void)
++{
++    return cmp_bar1_gb;
++}
++
++int cmp170hx_want_magicd_a100(void)
++{
++    return (cmp_magicd_a100 != 0) ? 1 : 0;
++}
++
++#define CMP_FUSE_MAP_SIZE              0x00830000U
++#define CMP_PMC_BOOT_0                 0x00000000U
++#define CMP_FUSE_FUSECTRL              0x00820000U
++#define CMP_FUSE_FUSEADDR              0x00820004U
++#define CMP_FUSE_FUSERDATA             0x00820008U
++#define CMP_FUSE_FUSEWDATA             0x0082000CU
++#define CMP_FUSE_EN_SW_OVERRIDE        0x00820040U
++#define CMP_FUSE_IFF_RECORD            0x00820050U
++#define CMP_FUSE_DSOV_STATUS           0x00820084U
++#define CMP_FUSE_IFF_SW_FUSING         0x00820088U
++#define CMP_FUSE_DEBUGCTRL_PLM         0x008200E0U
++#define CMP_FUSE_FUSEWDATA_PLM         0x008200F4U
++
++#define CMP_FUSE_OPT_DISABLE_GEN3      0x00820250U
++#define CMP_FUSE_OPT_ROP_L2_DISABLE    0x008202C4U
++#define CMP_FUSE_OPT_GPC_DISABLE       0x00820350U
++#define CMP_FUSE_OPT_FBP_DISABLE       0x00820364U
++#define CMP_FUSE_OPT_FBPA_DISABLE      0x00820368U
++#define CMP_FUSE_OPT_FBIO_DISABLE      0x0082036CU
++#define CMP_FUSE_OPT_MAGIC_D           0x00820520U
++#define CMP_FUSE_OPT_BOOT_GEN3_DIS     0x00820580U
++#define CMP_FUSE_OPT_GPC_DEFECTIVE     0x008205C4U
++#define CMP_FUSE_OPT_FBP_DEFECTIVE     0x008205CCU
++#define CMP_FUSE_OPT_FBPA_DEFECTIVE    0x008205D0U
++#define CMP_FUSE_OPT_FBIO_DEFECTIVE    0x008205D4U
++#define CMP_FUSE_OPT_ROP_L2_DEFECTIVE  0x008205E8U
++#define CMP_FUSE_OPT_PES_DISABLE       0x00820690U
++#define CMP_FUSE_OPT_PES_DEFECTIVE     0x00820698U
++#define CMP_FUSE_OPT_TPC_DISABLE_BASE  0x00820760U
++#define CMP_FUSE_STATUS_OPT_GPC        0x00820C1CU
++#define CMP_FUSE_STATUS_OPT_FBP        0x00820D38U
++
++#define CMP_FUSE_MAGIC_D_GEN4_DIS      0x02000000U
++#define CMP_FUSE_MAGIC_D_A100_EXTRA    0x14480000U
++
++#define CMP_IFF_STOCK_LO               488U
++#define CMP_IFF_STOCK_HI               507U
++#define CMP_IFF_STOCK_ROWS             20U
++#define CMP_IFF_STOCK_PTR              0x01FB01E8U
++#define CMP_IFF_STOCK_FIRST            0x000D56BDU
++#define CMP_IFF_STOCK_LAST             0xA0802007U
++#define CMP_IFF_MIN_START              301U
++#define CMP_IFF_ENC_WRITE_DW(addr)     ((((addr) >> 2) << 6) | 0x3DU)
++
++static const NvU32 cmp_tpc_defective_addrs[8] = {
++    0x008205C8U, 0x00820508U, 0x0082050CU, 0x00820514U,
++    0x00820564U, 0x008205ACU, 0x00820B84U, 0x00820B80U,
++};
++
++static const NvU32 cmp_tpc_cp_addrs[8] = {
++    0x00820230U, 0x00820504U, 0x008205F4U, 0x008205A0U,
++    0x008204C4U, 0x008204CCU, 0x00820B8CU, 0x00820B88U,
++};
++
++static const struct {
++    NvU32 cp;
++    NvU32 opt;
++    NvU32 mask;
++} cmp_fuse_cp_seed_table[] = {
++    { 0x0082022CU, 0x00820350U, 0x000000FFU }, /* gpc */
++    { 0x00820234U, 0x00820364U, 0x00000FFFU }, /* fbp */
++    { 0x00820454U, 0x00820368U, 0x00FFFFFFU }, /* fbpa */
++    { 0x00820460U, 0x0082036CU, 0x00FFFFFFU }, /* fbio */
++    { 0x008202E4U, 0x008202C4U, 0x00FFFFFFU }, /* rop_l2 */
++    { 0x00820230U, 0x00820760U, 0x000000FFU }, /* tpc0 */
++    { 0x00820504U, 0x00820764U, 0x000000FFU }, /* tpc1 */
++    { 0x008205F4U, 0x00820768U, 0x000000FFU }, /* tpc2 */
++    { 0x008205A0U, 0x0082076CU, 0x000000FFU }, /* tpc3 */
++    { 0x008204C4U, 0x00820770U, 0x000000FFU }, /* tpc4 */
++    { 0x008204CCU, 0x00820774U, 0x000000FFU }, /* tpc5 */
++    { 0x00820B8CU, 0x00820778U, 0x000000FFU }, /* tpc6 */
++    { 0x00820B88U, 0x0082077CU, 0x000000FFU }, /* tpc7 */
++    { 0x00820688U, 0x00820684U, 0x0000FFFFU }, /* nvlink */
++};
++
++/* Per-BDF one-shot guard so SW-IFF FLR can never loop (e.g. inside ESXi VM) */
++static NvU32 cmp_swiff_flr_seen[16];
++static unsigned int cmp_swiff_flr_count = 0;
++
++static NvBool cmp_reg_is_poison(NvU32 v)
++{
++    return (v == 0xFFFFFFFFU) || ((v & 0xFFFF0000U) == 0xBADF0000U);
++}
++
++static NvU32 cmp_bdf_key(struct pci_dev *pci_dev)
++{
++    return (((NvU32)(pci_domain_nr(pci_dev->bus) & 0xFFFFU)) << 16) |
++           (((NvU32)(pci_dev->bus->number & 0xFFU)) << 8) |
++           ((NvU32)(pci_dev->devfn & 0xFFU));
++}
++
++static NvBool cmp_swiff_flr_was_tried(struct pci_dev *pci_dev)
++{
++    NvU32 key = cmp_bdf_key(pci_dev);
++    unsigned int i;
++
++    for (i = 0; i < cmp_swiff_flr_count; i++)
++    {
++        if (cmp_swiff_flr_seen[i] == key)
++            return NV_TRUE;
++    }
++    return NV_FALSE;
++}
++
++static void cmp_swiff_flr_mark_tried(struct pci_dev *pci_dev)
++{
++    NvU32 key = cmp_bdf_key(pci_dev);
++    unsigned int i;
++
++    for (i = 0; i < cmp_swiff_flr_count; i++)
++    {
++        if (cmp_swiff_flr_seen[i] == key)
++            return;
++    }
++    if (cmp_swiff_flr_count < ARRAY_SIZE(cmp_swiff_flr_seen))
++        cmp_swiff_flr_seen[cmp_swiff_flr_count++] = key;
++}
++
++static NvBool cmp_fuse_wait_idle(void __iomem *bar0)
++{
++    unsigned int i;
++    NvU32 v;
++
++    for (i = 0; i < 2000; i++)
++    {
++        v = readl(bar0 + CMP_FUSE_FUSECTRL);
++        if (cmp_reg_is_poison(v))
++            return NV_FALSE;
++        if (((v >> 16) & 0x1FU) == 4U)
++            return NV_TRUE;
++        udelay(100);
++    }
++    return NV_FALSE;
++}
++
++static NvBool cmp_fuse_read_row(void __iomem *bar0, NvU32 row, NvU32 *out)
++{
++    writel(row, bar0 + CMP_FUSE_FUSEADDR);
++    writel(1U, bar0 + CMP_FUSE_FUSECTRL); /* CMD_READ only; never CMD_WRITE */
++    if (!cmp_fuse_wait_idle(bar0))
++        return NV_FALSE;
++    *out = readl(bar0 + CMP_FUSE_FUSERDATA);
++    return NV_TRUE;
++}
++
++static NvBool cmp_swiff_wait_idle(void __iomem *bar0)
++{
++    unsigned int i;
++    NvU32 v;
++
++    for (i = 0; i < 2000; i++)
++    {
++        v = readl(bar0 + CMP_FUSE_IFF_SW_FUSING);
++        if (cmp_reg_is_poison(v))
++            return NV_FALSE;
++        if ((v & 1U) == 0U)
++            return NV_TRUE;
++        udelay(100);
++    }
++    return NV_FALSE;
++}
++
++static NvBool cmp_swiff_write_slot(void __iomem *bar0, NvU32 row, NvU32 val)
++{
++    if (!cmp_swiff_wait_idle(bar0))
++        return NV_FALSE;
++    writel(row, bar0 + CMP_FUSE_FUSEADDR);
++    writel(val, bar0 + CMP_FUSE_FUSEWDATA);
++    /* Volatile SRAM overlay trigger (0x820088); never FUSECTRL CMD_WRITE */
++    writel(1U, bar0 + CMP_FUSE_IFF_SW_FUSING);
++    return cmp_swiff_wait_idle(bar0);
++}
++
++static void cmp_seed_cp_and_enable_sw_override(void __iomem *bar0)
++{
++    unsigned int i;
++    NvU32 fused;
++
++    if ((readl(bar0 + CMP_FUSE_EN_SW_OVERRIDE) & 1U) != 0U)
++        return;
++
++    for (i = 0; i < ARRAY_SIZE(cmp_fuse_cp_seed_table); i++)
++    {
++        fused = readl(bar0 + cmp_fuse_cp_seed_table[i].opt) &
++                cmp_fuse_cp_seed_table[i].mask;
++        writel(fused, bar0 + cmp_fuse_cp_seed_table[i].cp);
++    }
++    writel(1U, bar0 + CMP_FUSE_EN_SW_OVERRIDE);
++    (void)readl(bar0 + CMP_FUSE_EN_SW_OVERRIDE);
++}
++
++static void nv_cmp170hx_probe_unlock(struct pci_dev *pci_dev, NvU8 bar)
++{
++    void __iomem *bar0 = NULL;
++    unsigned int domain, bus, slot, fn;
++    int want_vram, want_sm, want_gen;
++    NvU32 boot0, dsov;
++    NvBool sw_ovr_allowed;
++    NvU32 gpc_def, gpc_dis, pes_def, pes_dis;
++    NvU32 tpc_def[8], tpc_dis[8];
++    NvU32 target_gpc, target_pes, target_tpc[8];
++    NvU32 fbp_def, fbp_dis, fbpa_def, fbio_def, l2_def;
++    NvU32 target_fbp, target_fbpa, target_fbio, target_l2;
++    NvBool need_sm_unlock = NV_FALSE;
++    NvBool need_fbp_unlock = NV_FALSE;
++    NvU32 g, f, sm_target = 0;
++
++    if ((pci_dev == NULL) ||
++        (pci_dev->vendor != 0x10de) ||
++        ((pci_dev->device != 0x2082) && (pci_dev->device != 0x20c2)))
++        return;
++
++    domain = (unsigned int)pci_domain_nr(pci_dev->bus);
++    bus    = (unsigned int)pci_dev->bus->number;
++    slot   = (unsigned int)PCI_SLOT(pci_dev->devfn);
++    fn     = (unsigned int)PCI_FUNC(pci_dev->devfn);
++
++    want_vram = cmp170hx_want_unlock_vram(domain, bus, slot, fn);
++    want_sm   = cmp170hx_want_unlock_sm(domain, bus, slot, fn);
++    want_gen  = cmp170hx_want_max_pcie_gen(domain, bus, slot, fn);
++
++    if ((want_sm <= 0) && (want_gen <= 2) && (want_vram <= 0))
++        return;
++
++    if (NV_PCI_RESOURCE_SIZE(pci_dev, bar) < CMP_FUSE_MAP_SIZE)
++    {
++        dev_warn(&pci_dev->dev,
++                 "CMP fused: BAR0 smaller than 0x%x; skipping probe unlock\n",
++                 CMP_FUSE_MAP_SIZE);
++        return;
++    }
++
++    bar0 = ioremap(NV_PCI_RESOURCE_START(pci_dev, bar), CMP_FUSE_MAP_SIZE);
++    if (bar0 == NULL)
++    {
++        dev_warn(&pci_dev->dev, "CMP fused: cannot map BAR0; skipping probe unlock\n");
++        return;
++    }
++
++    boot0 = readl(bar0 + CMP_PMC_BOOT_0);
++    if ((boot0 == 0U) || cmp_reg_is_poison(boot0))
++    {
++        dev_warn(&pci_dev->dev,
++                 "CMP fused: PMC_BOOT_0=0x%08x invalid; skipping probe unlock\n",
++                 boot0);
++        goto out;
++    }
++
++    dsov = readl(bar0 + CMP_FUSE_DSOV_STATUS);
++    if (cmp_reg_is_poison(dsov))
++    {
++        dev_warn(&pci_dev->dev,
++                 "CMP fused: DSOV read poison (0x%08x); skipping probe unlock\n",
++                 dsov);
++        goto out;
++    }
++    sw_ovr_allowed = ((dsov & 1U) == 0U);
++
++    if (!sw_ovr_allowed)
++    {
++        /* Stock or permanently FF-burned card (DSOV=1): nothing volatile to do at probe. */
++        goto out;
++    }
++
++    /* Read live defect floorplan and current disable masks. */
++    gpc_def  = readl(bar0 + CMP_FUSE_OPT_GPC_DEFECTIVE) & 0xFFU;
++    gpc_dis  = readl(bar0 + CMP_FUSE_OPT_GPC_DISABLE) & 0xFFU;
++    pes_def  = readl(bar0 + CMP_FUSE_OPT_PES_DEFECTIVE) & 0xFFFFFFU;
++    pes_dis  = readl(bar0 + CMP_FUSE_OPT_PES_DISABLE) & 0xFFFFFFU;
++    fbp_def  = readl(bar0 + CMP_FUSE_OPT_FBP_DEFECTIVE) & 0xFFFU;
++    fbp_dis  = readl(bar0 + CMP_FUSE_OPT_FBP_DISABLE) & 0xFFFU;
++    fbpa_def = readl(bar0 + CMP_FUSE_OPT_FBPA_DEFECTIVE) & 0xFFFFFFU;
++    fbio_def = readl(bar0 + CMP_FUSE_OPT_FBIO_DEFECTIVE) & 0xFFFFFFU;
++    l2_def   = readl(bar0 + CMP_FUSE_OPT_ROP_L2_DEFECTIVE) & 0xFFFFFFU;
++
++    target_gpc = gpc_def;
++    target_pes = pes_def;
++    for (g = 0; g < 8U; g++)
++    {
++        tpc_def[g] = readl(bar0 + cmp_tpc_defective_addrs[g]) & 0xFFU;
++        tpc_dis[g] = readl(bar0 + CMP_FUSE_OPT_TPC_DISABLE_BASE + g * 4U) & 0xFFU;
++        if (tpc_def[g] == 0xFFU)
++            target_gpc |= (1U << g);
++        if ((target_gpc & (1U << g)) != 0U)
++        {
++            target_pes |= (0x7U << (3U * g));
++            target_tpc[g] = 0xFFU;
++        }
++        else
++        {
++            NvU32 t;
++            target_tpc[g] = tpc_def[g];
++            for (t = 0; t < 8U; t++)
++            {
++                if ((target_tpc[g] & (1U << t)) == 0U)
++                    sm_target += 2U;
++            }
++            if ((tpc_dis[g] & ~target_tpc[g]) != 0U)
++                need_sm_unlock = NV_TRUE;
++        }
++    }
++    if (((gpc_dis & ~target_gpc) != 0U) || ((pes_dis & ~target_pes) != 0U))
++        need_sm_unlock = NV_TRUE;
++
++    /* Compute coherent defect-preserving FBP mask (for lucky 48G 10GB cards if DSOV=0). */
++    target_fbp  = fbp_def;
++    target_fbpa = fbpa_def;
++    target_fbio = fbio_def;
++    target_l2   = l2_def;
++    for (f = 0; f < 12U; f++)
++    {
++        NvU32 sub = (0x3U << (2U * f));
++        if (((target_fbp & (1U << f)) != 0U) ||
++            ((fbpa_def & sub) != 0U) ||
++            ((fbio_def & sub) != 0U) ||
++            ((l2_def & sub) != 0U))
++        {
++            target_fbp  |= (1U << f);
++            target_fbpa |= sub;
++            target_fbio |= sub;
++            target_l2   |= sub;
++        }
++    }
++    if ((want_vram > 0) && ((fbp_dis & ~target_fbp) != 0U))
++        need_fbp_unlock = NV_TRUE;
++
++    /*
++     * Step 1: Volatile SW-IFF SRAM overlay + single-shot bare-metal FLR.
++     * Replays defect-preserving GPC/PES/TPC (and coherent FBP if applicable)
++     * at fuse sense before DevInit, with zero OTP fuse writes.
++     */
++    if (((want_sm >= 1) && need_sm_unlock) || need_fbp_unlock)
++    {
++        NvU32 plm_e0 = readl(bar0 + CMP_FUSE_DEBUGCTRL_PLM);
++        NvU32 plm_f4 = readl(bar0 + CMP_FUSE_FUSEWDATA_PLM);
++        NvBool plms_open = (((plm_e0 >> 4) & 1U) != 0U) &&
++                           (((plm_f4 >> 4) & 1U) != 0U);
++
++        if (plms_open && !cmp_swiff_flr_was_tried(pci_dev))
++        {
++            NvU32 stock[CMP_IFF_STOCK_ROWS];
++            NvU32 words[64];
++            NvU32 nwords = 0;
++            NvU32 start, iff_val, i, mismatches = 0;
++            NvBool ok = NV_TRUE;
++
++            /* Read stock 20-row IFF stream from main fuse array with EN_SW_OVERRIDE=0. */
++            if ((readl(bar0 + CMP_FUSE_EN_SW_OVERRIDE) & 1U) != 0U)
++            {
++                writel(0U, bar0 + CMP_FUSE_EN_SW_OVERRIDE);
++                msleep(50);
++            }
++            writel(CMP_IFF_STOCK_PTR, bar0 + CMP_FUSE_IFF_RECORD);
++            msleep(50);
++
++            for (i = 0; i < CMP_IFF_STOCK_ROWS; i++)
++            {
++                if (!cmp_fuse_read_row(bar0, CMP_IFF_STOCK_LO + i, &stock[i]))
++                {
++                    ok = NV_FALSE;
++                    break;
++                }
++            }
++
++            if (!ok || (stock[0] != CMP_IFF_STOCK_FIRST) ||
++                (stock[CMP_IFF_STOCK_ROWS - 1U] != CMP_IFF_STOCK_LAST))
++            {
++                dev_warn(&pci_dev->dev,
++                         "CMP SW-IFF: stock stream mismatch (ok=%u first=0x%08x last=0x%08x); skipping SW-IFF\n",
++                         ok ? 1U : 0U, ok ? stock[0] : 0U,
++                         ok ? stock[CMP_IFF_STOCK_ROWS - 1U] : 0U);
++            }
++            else
++            {
++                /* IFF_STOCK_FIRST=1 ordering: EN_SW_OVERRIDE=1, then 20 stock rows, then payload. */
++                words[nwords++] = CMP_IFF_ENC_WRITE_DW(CMP_FUSE_EN_SW_OVERRIDE);
++                words[nwords++] = 1U;
++                for (i = 0; i < CMP_IFF_STOCK_ROWS; i++)
++                    words[nwords++] = stock[i];
++
++                if ((want_sm >= 1) && need_sm_unlock)
++                {
++                    words[nwords++] = CMP_IFF_ENC_WRITE_DW(CMP_FUSE_OPT_GPC_DISABLE);
++                    words[nwords++] = target_gpc;
++                    words[nwords++] = CMP_IFF_ENC_WRITE_DW(CMP_FUSE_OPT_PES_DISABLE);
++                    words[nwords++] = target_pes;
++                    for (g = 0; g < 8U; g++)
++                    {
++                        if ((target_gpc & (1U << g)) == 0U)
++                        {
++                            words[nwords++] = CMP_IFF_ENC_WRITE_DW(CMP_FUSE_OPT_TPC_DISABLE_BASE + g * 4U);
++                            words[nwords++] = target_tpc[g];
++                        }
++                    }
++                }
++                if (need_fbp_unlock)
++                {
++                    words[nwords++] = CMP_IFF_ENC_WRITE_DW(CMP_FUSE_OPT_FBP_DISABLE);
++                    words[nwords++] = target_fbp;
++                    words[nwords++] = CMP_IFF_ENC_WRITE_DW(CMP_FUSE_OPT_FBPA_DISABLE);
++                    words[nwords++] = target_fbpa;
++                    words[nwords++] = CMP_IFF_ENC_WRITE_DW(CMP_FUSE_OPT_FBIO_DISABLE);
++                    words[nwords++] = target_fbio;
++                    words[nwords++] = CMP_IFF_ENC_WRITE_DW(CMP_FUSE_OPT_ROP_L2_DISABLE);
++                    words[nwords++] = target_l2;
++                }
++
++                start = CMP_IFF_STOCK_HI + 1U - nwords;
++                if ((nwords > ARRAY_SIZE(words)) || (start < CMP_IFF_MIN_START))
++                {
++                    dev_warn(&pci_dev->dev,
++                             "CMP SW-IFF: window out of range (start=%u nwords=%u); skipping\n",
++                             start, nwords);
++                }
++                else
++                {
++                    iff_val = (start & 0xFFFFU) | ((CMP_IFF_STOCK_HI & 0xFFFFU) << 16);
++                    writel(1U, bar0 + CMP_FUSE_EN_SW_OVERRIDE);
++                    writel(iff_val, bar0 + CMP_FUSE_IFF_RECORD);
++
++                    for (i = 0; i < nwords; i++)
++                    {
++                        if (!cmp_swiff_write_slot(bar0, start + i, words[i]))
++                        {
++                            ok = NV_FALSE;
++                            break;
++                        }
++                    }
++                    if (ok)
++                    {
++                        for (i = 0; i < nwords; i++)
++                        {
++                            NvU32 rb = 0;
++                            if (!cmp_fuse_read_row(bar0, start + i, &rb) || (rb != words[i]))
++                                mismatches++;
++                        }
++                    }
++
++                    if (!ok || (mismatches != 0U))
++                    {
++                        /* Safety rollback: disarm SRAM overlay and do NOT FLR. */
++                        writel(0U, bar0 + CMP_FUSE_IFF_SW_FUSING);
++                        writel(CMP_IFF_STOCK_PTR, bar0 + CMP_FUSE_IFF_RECORD);
++                        writel(0U, bar0 + CMP_FUSE_EN_SW_OVERRIDE);
++                        dev_err(&pci_dev->dev,
++                                "CMP SW-IFF: SRAM verify failed (ok=%u mismatches=%u); disarmed cleanly\n",
++                                ok ? 1U : 0U, mismatches);
++                    }
++                    else
++                    {
++                        int flr_rc;
++                        NvU32 post_boot = 0xFFFFFFFFU;
++                        NvU32 post_iff, post_gpc;
++
++                        dev_warn(&pci_dev->dev,
++                                 "CMP SW-IFF: armed %u slots (START=%u LAST=%u target_gpc=0x%02x target_pes=0x%06x ~%u SMs); issuing single-shot FLR\n",
++                                 nwords, start, CMP_IFF_STOCK_HI,
++                                 target_gpc, target_pes, sm_target);
++
++                        cmp_swiff_flr_mark_tried(pci_dev);
++                        iounmap(bar0);
++                        bar0 = NULL;
++
++                        {
++                            u16 cmd = 0;
++                            pci_save_state(pci_dev);
++                            flr_rc = pcie_flr(pci_dev);
++                            pci_restore_state(pci_dev);
++                            if ((pci_read_config_word(pci_dev, PCI_COMMAND, &cmd) == 0) &&
++                                ((cmd & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) !=
++                                 (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)))
++                            {
++                                pci_write_config_word(pci_dev, PCI_COMMAND,
++                                    cmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
++                            }
++                            msleep(100);
++                        }
++
++                        bar0 = ioremap(NV_PCI_RESOURCE_START(pci_dev, bar), CMP_FUSE_MAP_SIZE);
++                        if (bar0 == NULL)
++                        {
++                            dev_err(&pci_dev->dev, "CMP SW-IFF: failed to remap BAR0 after FLR\n");
++                            return;
++                        }
++                        for (i = 0; i < 100; i++)
++                        {
++                            post_boot = readl(bar0 + CMP_PMC_BOOT_0);
++                            if ((post_boot != 0U) && !cmp_reg_is_poison(post_boot))
++                                break;
++                            msleep(20);
++                        }
++                        post_iff = readl(bar0 + CMP_FUSE_IFF_RECORD);
++                        post_gpc = readl(bar0 + CMP_FUSE_STATUS_OPT_GPC) & 0xFFU;
++                        if (post_iff == CMP_IFF_STOCK_PTR)
++                        {
++                            dev_warn(&pci_dev->dev,
++                                     "CMP SW-IFF: post-FLR IFF_RECORD reverted to stock (flr_rc=%d, VM passthrough?); continuing with stock GPCs\n",
++                                     flr_rc);
++                        }
++                        else
++                        {
++                            dev_warn(&pci_dev->dev,
++                                     "CMP SW-IFF: post-FLR OK (flr_rc=%d IFF_RECORD=0x%08x STATUS_OPT_GPC=0x%02x STATUS_OPT_FBP=0x%03x)\n",
++                                     flr_rc, post_iff, post_gpc,
++                                     readl(bar0 + CMP_FUSE_STATUS_OPT_FBP) & 0xFFFU);
++                        }
++                    }
++                }
++            }
++        }
++        else if (!plms_open)
++        {
++            if (want_sm >= 2)
++            {
++                /* Optional safe fallback (e.g. ESXi VM): unmask only non-defective TPCs inside already-awake GPCs. */
++                cmp_seed_cp_and_enable_sw_override(bar0);
++                for (g = 0; g < 8U; g++)
++                {
++                    if (((gpc_dis & (1U << g)) == 0U) && ((tpc_dis[g] & ~target_tpc[g]) != 0U))
++                    {
++                        writel(target_tpc[g], bar0 + cmp_tpc_cp_addrs[g]);
++                        writel(target_tpc[g], bar0 + CMP_FUSE_OPT_TPC_DISABLE_BASE + g * 4U);
++                    }
++                }
++                dev_warn(&pci_dev->dev,
++                         "CMP SW-IFF: PLMs closed (0x8200e0=0x%08x 0x8200f4=0x%08x); applied late TPC-only override on awake GPCs\n",
++                         plm_e0, plm_f4);
++            }
++            else
++            {
++                dev_warn(&pci_dev->dev,
++                         "CMP SW-IFF: PLMs closed on cold boot (0x8200e0=0x%08x 0x8200f4=0x%08x); SEC2 booter will open them — rebind GPU or enable cmp-swiff.service for %u SMs\n",
++                         plm_e0, plm_f4, sm_target);
++            }
++        }
++    }
++
++    /*
++     * Step 2: Volatile PCIe Gen3 / Gen4 fuse shadow overrides (pre-RM/GSP).
++     * Only runs on DSOV=0 cards when requested speed > Gen2 and fuses are still set.
++     */
++    if (want_gen >= 3)
++    {
++        NvU32 gen3_pre  = readl(bar0 + CMP_FUSE_OPT_DISABLE_GEN3);
++        NvU32 bgen3_pre = readl(bar0 + CMP_FUSE_OPT_BOOT_GEN3_DIS);
++        NvU32 magic_pre = readl(bar0 + CMP_FUSE_OPT_MAGIC_D);
++        NvU32 magic_clr = 0U;
++        NvBool need_gen3 = ((gen3_pre & 1U) != 0U) || ((bgen3_pre & 1U) != 0U);
++        NvBool need_gen4 = NV_FALSE;
++
++        if (want_gen >= 4)
++        {
++            magic_clr = CMP_FUSE_MAGIC_D_GEN4_DIS;
++            if (cmp170hx_want_magicd_a100())
++                magic_clr |= CMP_FUSE_MAGIC_D_A100_EXTRA;
++            if ((magic_pre & magic_clr) != 0U)
++                need_gen4 = NV_TRUE;
++        }
++
++        if (need_gen3 || need_gen4)
++        {
++            cmp_seed_cp_and_enable_sw_override(bar0);
++
++            if ((gen3_pre & 1U) != 0U)
++                writel(gen3_pre & ~1U, bar0 + CMP_FUSE_OPT_DISABLE_GEN3);
++            if ((bgen3_pre & 1U) != 0U)
++                writel(bgen3_pre & ~1U, bar0 + CMP_FUSE_OPT_BOOT_GEN3_DIS);
++            if (need_gen4)
++                writel(magic_pre & ~magic_clr, bar0 + CMP_FUSE_OPT_MAGIC_D);
++
++            dev_warn(&pci_dev->dev,
++                     "CMP fuse: PCIe Gen%d override EN_SW=%u 0x820250 0x%x->0x%x 0x820580 0x%x->0x%x MAGIC_D 0x%08x->0x%08x\n",
++                     want_gen,
++                     readl(bar0 + CMP_FUSE_EN_SW_OVERRIDE) & 1U,
++                     gen3_pre, readl(bar0 + CMP_FUSE_OPT_DISABLE_GEN3),
++                     bgen3_pre, readl(bar0 + CMP_FUSE_OPT_BOOT_GEN3_DIS),
++                     magic_pre, readl(bar0 + CMP_FUSE_OPT_MAGIC_D));
++        }
++    }
++
++out:
++    if (bar0 != NULL)
++        iounmap(bar0);
++}
+ 
+ #if defined(CONFIG_PM_DEVFREQ)
+ #include <linux/devfreq.h>
+@@ -2021,5 +2507,8 @@
+ 
+     NV_KZALLOC(nvl, sizeof(nv_linux_state_t));
++    if (nvl != NULL)
++        nv_cmp170hx_probe_unlock(pci_dev, regs_bar_index);
++
+     if (nvl == NULL)
+     {
+         nv_printf(NV_DBG_ERRORS, "NVRM: failed to allocate memory\n");

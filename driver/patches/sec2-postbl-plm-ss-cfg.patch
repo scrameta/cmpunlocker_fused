@@ -9,7 +9,7 @@ diff -Naur a/src/nvidia/generated/g_kernel_gsp_nvoc.h b/src/nvidia/generated/g_k
 diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
 --- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
 +++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
-@@ -101,4 +101,30 @@
+@@ -101,4 +101,107 @@
  #endif
  
 +#define SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID   0x20C2
@@ -29,6 +29,83 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +NV_STATUS kgspSec2PostblTimingRefillPayload(OBJGPU *pGpu, KernelGsp *pKernelGsp,
 +                                           NvU32 writeAddr, NvU32 writeValue);
 +NV_STATUS kgspSec2PostblTimingRebuildStockSignature(OBJGPU *pGpu, KernelGsp *pKernelGsp);
++
++extern int cmp170hx_want_unlock_vram(unsigned int domain, unsigned int bus,
++                                     unsigned int dev, unsigned int fn);
++
++static NvU32
++_kgspCmp170hxPopcount(NvU32 v)
++{
++    NvU32 c = 0;
++    while (v != 0U)
++    {
++        c += (v & 1U);
++        v >>= 1;
++    }
++    return c;
++}
++
++static void
++_kgspCmp170hxComputeGeometry(OBJGPU *pGpu, NvU32 *pCfg1, NvU32 *pLmr,
++                             NvU64 *pFbBytes, NvU32 *pActiveFbps)
++{
++    NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
++    NvU32 cfg1Value;
++    NvU32 lmrValue;
++    NvU64 targetFbBytes;
++    NvU32 statusFbp  = GPU_REG_RD32(pGpu, 0x00820d38U);
++    NvU32 statusFbpa = GPU_REG_RD32(pGpu, 0x00820c18U);
++    NvU32 statusFbio = GPU_REG_RD32(pGpu, 0x00820c14U);
++    NvU32 numActive  = GPU_REG_RD32(pGpu, 0x009a0164U);
++    NvU32 activeFbps = 0;
++    NvBool coherent = NV_FALSE;
++    int allowExtended = cmp170hx_want_unlock_vram(
++        gpuGetDomain(pGpu), gpuGetBus(pGpu), gpuGetDevice(pGpu), 0U);
++
++    if (statusFbp != 0xffffffffU && (statusFbp & 0xffff0000U) != 0xbadf0000U &&
++        statusFbpa != 0xffffffffU && (statusFbpa & 0xffff0000U) != 0xbadf0000U &&
++        statusFbio != 0xffffffffU && (statusFbio & 0xffff0000U) != 0xbadf0000U)
++    {
++        NvU32 fbpCnt  = 12U - _kgspCmp170hxPopcount(statusFbp & 0xfffU);
++        NvU32 fbpaCnt = 24U - _kgspCmp170hxPopcount(statusFbpa & 0xffffffU);
++        NvU32 fbioCnt = 24U - _kgspCmp170hxPopcount(statusFbio & 0xffffffU);
++        if (fbpCnt >= 8U && fbpCnt <= 12U &&
++            fbpaCnt == fbpCnt * 2U && fbioCnt == fbpCnt * 2U &&
++            (numActive == 0U || numActive == 0xffffffffU || numActive == fbpCnt))
++        {
++            activeFbps = fbpCnt;
++            coherent = NV_TRUE;
++        }
++    }
++
++    if (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
++    {
++        cfg1Value     = 0x02779000U;
++        lmrValue      = 0x0000020BU;
++        targetFbBytes = 0x0000001000000000ULL;
++        if (allowExtended && coherent && activeFbps > 8U)
++        {
++            lmrValue      = ((activeFbps * 4U) << 4) | 0x0000000BU;
++            targetFbBytes = (NvU64)activeFbps * 0x0000000200000000ULL;
++        }
++    }
++    else
++    {
++        cfg1Value     = 0x02669000U;
++        lmrValue      = 0x0000028AU;
++        targetFbBytes = 0x0000000A00000000ULL;
++        if (allowExtended && coherent && activeFbps > 10U)
++        {
++            lmrValue      = ((activeFbps * 4U) << 4) | 0x0000000AU;
++            targetFbBytes = (NvU64)activeFbps * 0x0000000100000000ULL;
++        }
++    }
++
++    if (pCfg1 != NULL)       *pCfg1 = cfg1Value;
++    if (pLmr != NULL)        *pLmr = lmrValue;
++    if (pFbBytes != NULL)    *pFbBytes = targetFbBytes;
++    if (pActiveFbps != NULL) *pActiveFbps = activeFbps;
++}
 +
 +static NvBool
 +_kgspSec2PostblTimingEnabled(OBJGPU *pGpu)
@@ -66,7 +143,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  
      {
          // If the new FB layout requires a scrubber ucode to scrub additional space, prepare it now
-@@ -4821,6 +4857,143 @@
+@@ -4821,6 +4857,146 @@
      // Setup arguments for bootstrapping GSP
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));
  
@@ -140,19 +217,13 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +
 +        {
 +            NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
-+            NvU32 cfg1Value;
-+            NvU32 lmrValue;
++            NvU32 cfg1Value = 0;
++            NvU32 lmrValue = 0;
++            NvU32 activeFbps = 0;
++            NvU64 targetFbBytes = 0;
 +
-+            if (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
-+            {
-+                cfg1Value = 0x02779000U;
-+                lmrValue  = 0x0000020BU;
-+            }
-+            else
-+            {
-+                cfg1Value = 0x02669000U;
-+                lmrValue  = 0x0000028AU;
-+            }
++            _kgspCmp170hxComputeGeometry(pGpu, &cfg1Value, &lmrValue,
++                                         &targetFbBytes, &activeFbps);
 +
 +            GPU_REG_WR32(pGpu, 0x0082381cU, 0x88888888U);
 +            GPU_REG_WR32(pGpu, 0x00823820U, 0x00000008U);
@@ -161,30 +232,39 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +
 +            NV_PRINTF(LEVEL_ERROR,
 +                      "SEC2_DEBUG: POST-WRITE SS0=0x%08x SS1=0x%08x "
-+                      "CFG1=0x%08x LMR=0x%08x (devId=0x%x)\n",
++                      "CFG1=0x%08x LMR=0x%08x activeFbps=%u targetFb=%lluGiB (devId=0x%x)\n",
 +                      GPU_REG_RD32(pGpu, 0x0082381cU),
 +                      GPU_REG_RD32(pGpu, 0x00823820U),
 +                      GPU_REG_RD32(pGpu, 0x009a0204U),
 +                      GPU_REG_RD32(pGpu, 0x00100ce0U),
++                      activeFbps,
++                      (unsigned long long)(targetFbBytes >> 30),
 +                      devId);
 +        }
 +
 +        {
 +            NvU32 gpc;
 +            NvU32 gpcDisable = GPU_REG_RD32(pGpu, 0x00820350U);
++            NvU32 gpcStatus  = GPU_REG_RD32(pGpu, 0x00820c1cU) & 0xffU;
++            NvU32 activeSms  = 0;
 +            NV_PRINTF(LEVEL_ERROR,
-+                      "SEC2_DEBUG: SM-RECONFIG start OPT_GPC_DISABLE=0x%08x\n",
-+                      gpcDisable);
++                      "SEC2_DEBUG: SM-RECONFIG start OPT_GPC_DISABLE=0x%08x STATUS_OPT_GPC=0x%02x\n",
++                      gpcDisable, gpcStatus);
 +            for (gpc = 0; gpc < 8; gpc++)
 +            {
 +                NvU32 statBefore = GPU_REG_RD32(pGpu, 0x00820c38U + gpc * 4U);
 +                NvU32 statAfter;
 +                GPU_REG_WR32(pGpu, 0x00820a40U + gpc * 4U, 0x000000ffU);
 +                statAfter = GPU_REG_RD32(pGpu, 0x00820c38U + gpc * 4U);
++                if ((gpcStatus & (1U << gpc)) == 0U)
++                    activeSms += 2U * (8U - _kgspCmp170hxPopcount(statAfter & 0xffU));
 +                NV_PRINTF(LEVEL_ERROR,
 +                          "SEC2_DEBUG: SM-RECONFIG GPC%u OVR<-0xff STATUS 0x%08x->0x%08x\n",
 +                          gpc, statBefore, statAfter);
 +            }
++            NV_PRINTF(LEVEL_ERROR,
++                      "SEC2_DEBUG: SM-RECONFIG summary activeSMs=%u (STATUS_OPT_GPC=0x%02x)\n",
++                      activeSms, gpcStatus);
 +        }
 +
 +        plmStatus = kgspSec2PostblTimingRebuildStockSignature(pGpu, pKernelGsp);
@@ -446,10 +526,10 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +        {
 +            NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO_PARAMS *pFbRegionInfoParams =
 +                &pGSCI->fbRegionInfoParams;
-+            NvU64 targetFbBytes = (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
-+                                    ? 0x0000001000000000ULL
-+                                    : 0x0000000A00000000ULL;
++            NvU64 targetFbBytes = 0;
 +            NvU32 numRegions = pFbRegionInfoParams->numFBRegions;
++
++            _kgspCmp170hxComputeGeometry(pGpu, NULL, NULL, &targetFbBytes, NULL);
 +
 +            NV_PRINTF(LEVEL_ERROR,
 +                      "SEC2_DEBUG: static-info BEFORE: fb_length=0x%llx numRegions=%u\n",

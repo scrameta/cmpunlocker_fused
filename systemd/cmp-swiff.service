@@ -1,0 +1,14 @@
+[Unit]
+Description=CMP 170HX cold-boot SW-IFF rebind helper (RIR-unlocked GPUs)
+After=systemd-modules-load.service local-fs.target
+Before=nvidia-persistenced.service docker.service
+ConditionPathExists=/usr/local/sbin/cmp-swiff-unlock
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cmp-swiff-unlock rebind
+TimeoutStartSec=60
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

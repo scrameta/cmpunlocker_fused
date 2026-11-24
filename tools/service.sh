@@ -118,7 +118,7 @@ verify_links() {
         width="$(cat "/sys/bus/pci/devices/${gpu}/current_link_width" 2>/dev/null || echo unknown)"
         max_speed="$(cat "/sys/bus/pci/devices/${gpu}/max_link_speed" 2>/dev/null || echo unknown)"
         if [[ "${generation}" =~ ^[0-9]+$ ]] && (( generation >= 2 )); then
-            result="GEN2 OK"
+            result="GEN${generation} OK"
         else
             result="GEN1"
             failures=$((failures + 1))

@@ -95,7 +95,13 @@ for i in "${!GPU_BDFS[@]}"; do
     status="FAIL"
     if is_unlocked_memory "${profile}" "${actual}"; then
         status="OK"
-        ok "${bdf}: ${actual} MiB (unlocked ${profile})"
+        if [[ "${profile}" == "8gb" ]] && (( actual >= 78000 )); then
+            ok "${bdf}: ${actual} MiB (unlocked ${profile} extended 80/96GB)"
+        elif [[ "${profile}" == "10gb" ]] && (( actual >= 46000 )); then
+            ok "${bdf}: ${actual} MiB (unlocked ${profile} extended 48GB)"
+        else
+            ok "${bdf}: ${actual} MiB (unlocked ${profile})"
+        fi
     elif is_stock_memory "${profile}" "${actual}"; then
         status="STOCK"
         err "${bdf}: still stock ${actual} MiB (expect ~${expected})"
@@ -114,11 +120,14 @@ for i in "${!GPU_BDFS[@]}"; do
 done
 
 step "Checking unlock logs and installed profile"
-sec2_logs="$(dmesg 2>/dev/null | grep 'SEC2_DEBUG' || true)"
+if [[ -r /sys/module/nvidia/parameters/cmp_auto ]]; then
+    info "Active nvidia cmp_* options: cmp_auto=$(cat /sys/module/nvidia/parameters/cmp_auto 2>/dev/null) cmp_unlock_vram=$(cat /sys/module/nvidia/parameters/cmp_unlock_vram 2>/dev/null) cmp_unlock_sm=$(cat /sys/module/nvidia/parameters/cmp_unlock_sm 2>/dev/null) cmp_max_pcie_gen=$(cat /sys/module/nvidia/parameters/cmp_max_pcie_gen 2>/dev/null) cmp_bar1_gb=$(cat /sys/module/nvidia/parameters/cmp_bar1_gb 2>/dev/null)"
+fi
+sec2_logs="$(dmesg 2>/dev/null | grep -E 'SEC2_DEBUG|CMP (SW-IFF|fuse|PCIe|BAR1)' || true)"
 if [[ -n "${sec2_logs}" ]]; then
-    ok "dmesg contains SEC2_DEBUG unlock logs"
+    ok "dmesg contains CMP unlock logs"
     info "Sample:"
-    printf '%s\n' "${sec2_logs}" | tail -n 8 | sed 's/^/  /'
+    printf '%s\n' "${sec2_logs}" | tail -n 12 | sed 's/^/  /'
 else
     warn "No SEC2_DEBUG lines in dmesg (logs may have rotated; unlock can still be OK if memory is unlocked)"
 fi
