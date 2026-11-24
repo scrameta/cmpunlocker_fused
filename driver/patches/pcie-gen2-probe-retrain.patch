@@ -11,9 +11,77 @@
  
  #include <sound/core.h>             /* HDA struct snd_card */
  
-@@ -1361,4 +1365,85 @@
+@@ -1361,4 +1365,276 @@
      nv_uvm_resume_P2P(pUuid);
  #endif
++}
++
++extern int cmp170hx_want_max_pcie_gen(unsigned int domain, unsigned int bus,
++                                      unsigned int dev, unsigned int fn);
++extern int cmp170hx_want_pcie_retrain(void);
++
++static int
++nv_cmp170hx_retrain_step(struct pci_dev *gpu, struct pci_dev *upstream,
++                         u16 step_gen, u16 *out_lnksta)
++{
++    u16 gpu_ctl2, upstream_ctl2, upstream_ctl, up_sta = 0, gpu_sta = 0;
++    int ret, poll;
++
++    /* Wait for any prior link training to finish before issuing a step. */
++    for (poll = 0; poll < 50; poll++)
++    {
++        ret = pcie_capability_read_word(upstream, PCI_EXP_LNKSTA, &up_sta);
++        if (ret)
++            return ret;
++        if ((up_sta & PCI_EXP_LNKSTA_LT) == 0)
++            break;
++        msleep(10);
++    }
++
++    ret = pcie_capability_read_word(gpu, PCI_EXP_LNKCTL2, &gpu_ctl2);
++    if (ret)
++        return ret;
++    ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL2, &upstream_ctl2);
++    if (ret)
++        return ret;
++
++    gpu_ctl2 = (gpu_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | (step_gen & PCI_EXP_LNKCTL2_TLS);
++    upstream_ctl2 = (upstream_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | (step_gen & PCI_EXP_LNKCTL2_TLS);
++
++    ret = pcie_capability_write_word(gpu, PCI_EXP_LNKCTL2, gpu_ctl2);
++    if (ret)
++        return ret;
++    ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL2, upstream_ctl2);
++    if (ret)
++        return ret;
++
++    ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL, &upstream_ctl);
++    if (ret)
++        return ret;
++    /* Single-shot retrain trigger (never looped for Gen3/Gen4). */
++    ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL,
++                                     upstream_ctl | PCI_EXP_LNKCTL_RL);
++    if (ret)
++        return ret;
++
++    msleep(50);
++    for (poll = 0; poll < 100; poll++)
++    {
++        ret = pcie_capability_read_word(upstream, PCI_EXP_LNKSTA, &up_sta);
++        if (ret)
++            return ret;
++        if ((up_sta & PCI_EXP_LNKSTA_LT) == 0)
++            break;
++        msleep(10);
++    }
++
++    msleep(20);
++    ret = pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &gpu_sta);
++    if (ret)
++        return ret;
++    if (out_lnksta != NULL)
++        *out_lnksta = gpu_sta;
++    return 0;
 +}
 +
 +static void
@@ -24,12 +92,22 @@
 +    struct pci_dev *upstream;
 +    void __iomem *bar0;
 +    u16 gpu_ctl2, upstream_ctl2, upstream_ctl, link_status = 0;
-+    u32 cya0, link_config;
-+    int ret, attempt;
++    u32 upstream_cap = 0, upstream_max_gen = 2U;
++    u32 cya0, link_config, opt_gen3, opt_bgen3, magic_d;
++    u32 target_gen = 2U, cur_gen = 0U;
++    int want_gen, ret, attempt;
++    NvBool gen3_ok, gen4_ok;
 +
 +    if ((gpu == NULL) ||
 +        ((gpu->device != 0x20c2) && (gpu->device != 0x2082)))
 +        return;
++
++    if (!cmp170hx_want_pcie_retrain())
++    {
++        NV_DEV_PRINTF(NV_DBG_INFO, nv,
++                      "CMP PCIe: automatic link retrain disabled (cmp_pcie_retrain=0)\n");
++        return;
++    }
 +
 +    upstream = pci_upstream_bridge(gpu);
 +    if (upstream == NULL)
@@ -38,66 +116,179 @@
 +                      "CMP Gen2: no upstream PCIe bridge; skipping link retrain\n");
 +        return;
 +    }
-+    bar0 = ioremap(pci_resource_start(gpu, 0), 0x90000);
++
++    if (pcie_capability_read_dword(upstream, PCI_EXP_LNKCAP, &upstream_cap) == 0)
++        upstream_max_gen = upstream_cap & PCI_EXP_LNKCAP_SLS;
++
++    want_gen = cmp170hx_want_max_pcie_gen(
++        (unsigned int)pci_domain_nr(gpu->bus),
++        (unsigned int)gpu->bus->number,
++        (unsigned int)PCI_SLOT(gpu->devfn),
++        (unsigned int)PCI_FUNC(gpu->devfn));
++
++    if (pci_resource_len(gpu, 0) < 0x830000ULL)
++    {
++        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
++                      "CMP Gen2: BAR0 too small; skipping link retrain\n");
++        return;
++    }
++    bar0 = ioremap(pci_resource_start(gpu, 0), 0x830000);
 +    if (bar0 == NULL)
 +    {
 +        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
 +                      "CMP Gen2: cannot map BAR0; skipping link retrain\n");
 +        return;
 +    }
-+    cya0 = readl(bar0 + 0x8c2c0);
-+    writel(cya0 & ~(1U << 2), bar0 + 0x8c2c0);
-+    link_config = readl(bar0 + 0x8c040);
-+    writel((link_config & ~0x000c0000U) | (2U << 18), bar0 + 0x8c040);
-+    writel(0x00000006U, bar0 + 0x8872c);
-+    (void)readl(bar0 + 0x8872c);
++
++    opt_gen3  = readl(bar0 + 0x820250);
++    opt_bgen3 = readl(bar0 + 0x820580);
++    magic_d   = readl(bar0 + 0x820520);
++    gen3_ok   = ((opt_gen3 & 1U) == 0U) && ((opt_bgen3 & 1U) == 0U);
++    gen4_ok   = gen3_ok && (magic_d != 0xffffffffU) && ((magic_d & 0x02000000U) == 0U);
++
++    if ((want_gen >= 3) && gen3_ok && (upstream_max_gen >= 3U))
++        target_gen = 3U;
++    if ((want_gen >= 4) && gen4_ok && (upstream_max_gen >= 4U))
++        target_gen = 4U;
++
++    if (target_gen == 2U)
++    {
++        cya0 = readl(bar0 + 0x8c2c0);
++        writel(cya0 & ~(1U << 2), bar0 + 0x8c2c0);
++        link_config = readl(bar0 + 0x8c040);
++        writel((link_config & ~0x000c0000U) | (2U << 18), bar0 + 0x8c040);
++        writel(0x00000006U, bar0 + 0x8872c);
++        (void)readl(bar0 + 0x8872c);
++        iounmap(bar0);
++        msleep(50);
++        ret = pcie_capability_read_word(gpu, PCI_EXP_LNKCTL2, &gpu_ctl2);
++        if (ret)
++            goto capability_error;
++        ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL2, &upstream_ctl2);
++        if (ret)
++            goto capability_error;
++        gpu_ctl2 = (gpu_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | PCI_EXP_LNKCTL2_TLS_5_0GT;
++        upstream_ctl2 = (upstream_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | PCI_EXP_LNKCTL2_TLS_5_0GT;
++        ret = pcie_capability_write_word(gpu, PCI_EXP_LNKCTL2, gpu_ctl2);
++        if (ret)
++            goto capability_error;
++        ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL2, upstream_ctl2);
++        if (ret)
++            goto capability_error;
++        ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL, &upstream_ctl);
++        if (ret)
++            goto capability_error;
++        ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL,
++                                         upstream_ctl | PCI_EXP_LNKCTL_RL);
++        if (ret)
++            goto capability_error;
++
++        for (attempt = 0; attempt < 20; attempt++)
++        {
++            msleep(100);
++            ret = pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &link_status);
++            if (!ret &&
++                ((link_status & PCI_EXP_LNKSTA_CLS) >= PCI_EXP_LNKSTA_CLS_5_0GB))
++            {
++                NV_DEV_PRINTF(NV_DBG_INFO, nv, "CMP Gen2: PCIe link trained to Gen%u\n",
++                              link_status & PCI_EXP_LNKSTA_CLS);
++                return;
++            }
++        }
++
++        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
++                      "CMP Gen2: PCIe retrain completed without Gen2 link (status=0x%04x, ret=%d)\n",
++                      link_status, ret);
++        return;
++    }
++
++    /*
++     * Gen3 / Gen4 path: preserve post-GSP PHY init (never clamp to Gen2),
++     * ensure E1 registers are intact for Gen4, then execute staged single-shot
++     * config-space retraining (Gen1 -> Gen2 -> Gen3 [-> Gen4]).
++     */
++    if (target_gen >= 4U)
++    {
++        u32 v;
++        writel(0x00000014U, bar0 + 0x88ce4);
++        v = readl(bar0 + 0x88ce0);
++        writel((v & ~0x3fU) | 0x06U, bar0 + 0x88ce0);
++        v = readl(bar0 + 0x8c2c0);
++        writel(v & ~((1U << 0) | (1U << 2) | (1U << 3) | (1U << 13) | (1U << 23)),
++               bar0 + 0x8c2c0);
++        v = readl(bar0 + 0x8c1c0);
++        writel((v & ~0x000f0000U) | (4U << 16), bar0 + 0x8c1c0);
++        v = readl(bar0 + 0x8c040);
++        writel(v & ~0x000c0000U, bar0 + 0x8c040);
++        v = readl(bar0 + 0x88610);
++        writel(v | 0x00001001U, bar0 + 0x88610);
++        (void)readl(bar0 + 0x8c040);
++    }
++    else
++    {
++        cya0 = readl(bar0 + 0x8c2c0);
++        writel(cya0 & ~((1U << 2) | (1U << 3)), bar0 + 0x8c2c0);
++        link_config = readl(bar0 + 0x8c040);
++        writel((link_config & ~0x000c0000U) | (1U << 18), bar0 + 0x8c040);
++        (void)readl(bar0 + 0x8c040);
++    }
 +    iounmap(bar0);
 +    msleep(50);
-+    ret = pcie_capability_read_word(gpu, PCI_EXP_LNKCTL2, &gpu_ctl2);
-+    if (ret)
-+        goto capability_error;
-+    ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL2, &upstream_ctl2);
-+    if (ret)
-+        goto capability_error;
-+    gpu_ctl2 = (gpu_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | PCI_EXP_LNKCTL2_TLS_5_0GT;
-+    upstream_ctl2 = (upstream_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | PCI_EXP_LNKCTL2_TLS_5_0GT;
-+    ret = pcie_capability_write_word(gpu, PCI_EXP_LNKCTL2, gpu_ctl2);
-+    if (ret)
-+        goto capability_error;
-+    ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL2, upstream_ctl2);
-+    if (ret)
-+        goto capability_error;
-+    ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL, &upstream_ctl);
-+    if (ret)
-+        goto capability_error;
-+    ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL,
-+                                     upstream_ctl | PCI_EXP_LNKCTL_RL);
-+    if (ret)
-+        goto capability_error;
 +
-+    for (attempt = 0; attempt < 20; attempt++)
++    ret = pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &link_status);
++    if (ret)
++        goto capability_error;
++    cur_gen = link_status & PCI_EXP_LNKSTA_CLS;
++
++    if (cur_gen < 2U)
 +    {
-+        msleep(100);
-+        ret = pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &link_status);
-+        if (!ret &&
-+            ((link_status & PCI_EXP_LNKSTA_CLS) >= PCI_EXP_LNKSTA_CLS_5_0GB))
++        ret = nv_cmp170hx_retrain_step(gpu, upstream, 2U, &link_status);
++        if (ret)
++            goto capability_error;
++        cur_gen = link_status & PCI_EXP_LNKSTA_CLS;
++        if (cur_gen < 2U)
 +        {
-+            NV_DEV_PRINTF(NV_DBG_INFO, nv, "CMP Gen2: PCIe link trained to Gen%u\n",
-+                          link_status & PCI_EXP_LNKSTA_CLS);
++            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
++                          "CMP PCIe: staged retrain stopped at Gen%u (LnkSta=0x%04x, target=Gen%u)\n",
++                          cur_gen, link_status, target_gen);
 +            return;
 +        }
 +    }
 +
++    if ((cur_gen < 3U) && (target_gen >= 3U))
++    {
++        ret = nv_cmp170hx_retrain_step(gpu, upstream, 3U, &link_status);
++        if (ret)
++            goto capability_error;
++        cur_gen = link_status & PCI_EXP_LNKSTA_CLS;
++        if (cur_gen < 3U)
++        {
++            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
++                          "CMP PCIe: Gen3 single-shot step stayed at Gen%u (LnkSta=0x%04x); stopping safely\n",
++                          cur_gen, link_status);
++            return;
++        }
++    }
++
++    if ((cur_gen < 4U) && (target_gen >= 4U))
++    {
++        ret = nv_cmp170hx_retrain_step(gpu, upstream, 4U, &link_status);
++        if (ret)
++            goto capability_error;
++        cur_gen = link_status & PCI_EXP_LNKSTA_CLS;
++    }
++
 +    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
-+                  "CMP Gen2: PCIe retrain completed without Gen2 link (status=0x%04x, ret=%d)\n",
-+                  link_status, ret);
++                  "CMP PCIe: link negotiated Gen%u x%u (LnkSta=0x%04x target=Gen%u hostMax=Gen%u)\n",
++                  cur_gen, (link_status & PCI_EXP_LNKSTA_NLW) >> PCI_EXP_LNKSTA_NLW_SHIFT,
++                  link_status, target_gen, upstream_max_gen);
 +    return;
 +capability_error:
 +    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
 +                  "CMP Gen2: PCIe capability access failed (%d); skipping link retrain\n", ret);
  }
  
-@@ -1530,6 +1624,8 @@
+@@ -1530,6 +1774,8 @@
          nv->flags |= NV_FLAG_PERSISTENT_SW_STATE;
      }
  

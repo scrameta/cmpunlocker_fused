@@ -1,14 +1,56 @@
 --- a/kernel-open/nvidia/nv-pci.c
 +++ b/kernel-open/nvidia/nv-pci.c
-@@ -337,6 +337,52 @@
+@@ -337,6 +337,97 @@
  #endif
  }
  
++static u32 nv_cmp_bar1_target_gb(struct pci_dev *pci_dev, resource_size_t bar0_start)
++{
++    int opt_gb = cmp170hx_want_bar1_gb();
++    unsigned int domain, bus, slot, fn;
++
++    if (opt_gb == 128)
++        return 128U;
++    if (opt_gb == 64)
++        return 64U;
++
++    /* Auto-size BAR1: 128 GiB when >64 GiB VRAM is active (80G/96G 0x20C2), else 64 GiB. */
++    domain = (unsigned int)pci_domain_nr(pci_dev->bus);
++    bus    = (unsigned int)pci_dev->bus->number;
++    slot   = (unsigned int)PCI_SLOT(pci_dev->devfn);
++    fn     = (unsigned int)PCI_FUNC(pci_dev->devfn);
++
++    if ((pci_dev->device == 0x20C2) &&
++        cmp170hx_want_unlock_vram(domain, bus, slot, fn) &&
++        (pci_resource_len(pci_dev, 0) >= 0x00830000ULL))
++    {
++        void __iomem *fuse = ioremap(bar0_start + 0x00820000ULL, 0x1000);
++        if (fuse != NULL)
++        {
++            u32 fbp_stat = readl(fuse + 0xD38);
++            iounmap(fuse);
++            if ((fbp_stat != 0xFFFFFFFFU) && ((fbp_stat & 0xFFFF0000U) != 0xBADF0000U))
++            {
++                u32 mask = fbp_stat & 0xFFFU;
++                u32 active_fbps = 0, bit;
++                for (bit = 0; bit < 12U; bit++)
++                {
++                    if ((mask & (1U << bit)) == 0U)
++                        active_fbps++;
++                }
++                if (active_fbps > 8U)
++                    return 128U;
++            }
++        }
++    }
++    return 64U;
++}
++
 +static void nv_cmp_unlock_bar1_resize(struct pci_dev *pci_dev)
 +{
 +#if defined(NV_PCI_REBAR_GET_POSSIBLE_SIZES_PRESENT)
 +    void __iomem *pcfg;
-+    u32 cya, cfg, cap;
++    u32 cya, cfg, cap, bar1_gb, bar1_cfg;
 +    resource_size_t bar0_start;
 +
 +    if (pci_dev->device != 0x20C2 && pci_dev->device != 0x2082)
@@ -17,6 +59,9 @@
 +    bar0_start = pci_resource_start(pci_dev, 0);
 +    if (!bar0_start)
 +        return;
++
++    bar1_gb = nv_cmp_bar1_target_gb(pci_dev, bar0_start);
++    bar1_cfg = (bar1_gb >= 128U) ? 0x8000000BU : 0x8000000AU;
 +
 +    pcfg = ioremap(bar0_start + 0x88000, 0x1000);
 +    if (!pcfg) {
@@ -33,7 +78,7 @@
 +        cya, cfg, cap);
 +
 +    writel(0x30,         pcfg + 0x724);
-+    writel(0x8000000A,   pcfg + 0xDCC);
++    writel(bar1_cfg,     pcfg + 0xDCC);
 +
 +    cya = readl(pcfg + 0x724);
 +    cfg = readl(pcfg + 0xDCC);
@@ -46,14 +91,14 @@
 +
 +    NVreg_EnableResizableBar = 1;
 +    nv_printf(NV_DBG_ERRORS,
-+        "NVRM: CMP BAR1: resize enabled, will attempt up to 64 GB\n");
++        "NVRM: CMP BAR1: resize enabled, will attempt up to %u GB\n", bar1_gb);
 +#endif
 +}
 +
  static int nv_resize_pcie_bars(struct pci_dev *pci_dev) {
  #if defined(NV_PCI_REBAR_GET_POSSIBLE_SIZES_PRESENT)
      u16 cmd;
-@@ -2087,12 +2133,21 @@
+@@ -2087,12 +2174,21 @@
          !nv_pci_validate_bars(pci_dev, /* only_bar0 = */ NV_FALSE))
          goto err_zero_dev;
  

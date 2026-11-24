@@ -119,7 +119,106 @@ Then perform a reboot.
     <td>Persistence across reboot (patched modules)</td>
     <td>Working ✓</td>
   </tr>
+  <tr>
+    <td>Extended VRAM (80/96GB on glitched 8GB cards, 48GB on lucky 12-FBP 10GB cards)</td>
+    <td>Opt-in (<code>cmp_unlock_vram=1</code> / <code>cmp_auto=1</code>) ✓</td>
+  </tr>
+  <tr>
+    <td>PCIe Gen3 &amp; Gen4 (RIR-unlocked 10GB or FF-burned 8GB/10GB, automatic single-shot retrain)</td>
+    <td>Opt-in (<code>cmp_max_pcie_gen=3|4</code> / <code>cmp_auto=1</code>) ✓</td>
+  </tr>
+  <tr>
+    <td>Full defect-preserving SM unlock (FF-burned cards + volatile SW-IFF on RIR-unlocked <code>DSOV=0</code> cards)</td>
+    <td>Opt-in (<code>cmp_unlock_sm=1</code> / <code>cmp_auto=1</code>) ✓</td>
+  </tr>
+  <tr>
+    <td>Auto-sized BAR1 (64GB for &le;64GB VRAM, 128GB for &gt;64GB VRAM)</td>
+    <td>Working (<code>cmp_bar1_gb=0|64|128</code>) ✓</td>
+  </tr>
 </table>
+
+---
+
+## Fused / RIR / Glitched Card Options (`nvidia.ko`)
+
+Every GPU (`10de:20c2` / `10de:2082`) is evaluated independently at runtime based on:
+1. **Live fuse state** (`DISABLE_SW_OVERRIDE_STATUS`, PCIe speed fuses, active coherent FBPs),
+2. **Hardware defect floorplan** (`OPT_*_DEFECTIVE` — factory-defective silicon is never unmasked), and
+3. **Kernel module options** (conservative defaults: plain 64GB/40GB, 74 SMs, PCIe Gen2).
+
+> **Zero OTP / No Fuse Burning:** Neither the patched driver nor any helper script in this repository writes `FUSECTRL CMD_WRITE` or `DEBUGCTRL`. All SW-IFF writes target the volatile SRAM overlay via `IFF_SW_FUSING (0x820088)` and disappear on power cycle.
+
+### What Each Card Gets
+
+| Card State | Conservative Default (`sudo ./install.sh`) | Auto Mode (`sudo ./install.sh --auto` / `cmp_auto=1`) |
+|---|---|---|
+| Plain stock 8 GB (`0x20C2`, `DSOV=1`) | 64 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2 | 64 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2 |
+| Plain stock 10 GB (`0x2082`, `DSOV=1`) | 40 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2 | 40 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2 |
+| RIR-unlocked 10 GB (`0x2082`, `DSOV=0`) | 40 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2 | 40 GiB (or 48 GiB if 12 non-defective FBPs), 64 GiB BAR1, all non-defective SMs via SW-IFF (up to 128), PCIe Gen4 (or host slot max) |
+| Glitched / FF-burned 8 GB (`0x20C2`, 10 FBPs, Gen4 fuses) | 64 GiB, 64 GiB BAR1, burned SMs + RECONFIG, PCIe Gen2 | **80 GiB**, **128 GiB BAR1**, all non-defective SMs + RECONFIG, **PCIe Gen4** (or host slot max) |
+
+### Kernel Module Options
+
+| Option | Default | Description |
+|---|---|---|
+| `cmp_auto=0\|1` | `0` | `0` = conservative defaults (stock cmpunlocker behavior). `1` = automatically enable every unlock allowed by each card's fuses, defect floorplan, and host PCIe root port. |
+| `cmp_unlock_vram=-1\|0\|1` | `-1` | `-1` = follow `cmp_auto`. `0` = cap to 64/40 GiB. `1` = size VRAM dynamically from active coherent FBPs (`80/96 GiB` on glitched 8GB cards, `48 GiB` on 12-FBP 10GB cards). |
+| `cmp_unlock_sm=-1\|0\|1\|2` | `-1` | `-1` = follow `cmp_auto`. `0` = off. `1` = volatile defect-preserving SW-IFF + single-shot FLR on `DSOV=0` cards (bare metal). `2` = SW-IFF when PLMs are open, else late TPC-only override inside already-awake GPCs (~80 SMs, VM fallback). |
+| `cmp_max_pcie_gen=-1\|2\|3\|4` | `-1` | `-1` = follow `cmp_auto` (`2` conservative, `4` auto). Caps per-card PCIe target by card fuses and host root-port `LnkCap`. |
+| `cmp_pcie_retrain=0\|1` | `1` | `1` = automatic staged single-shot link retrain (`Gen1 -> 2 -> 3 [-> 4]`) during init. `0` = apply PHY init only (manual retrain). |
+| `cmp_bar1_gb=0\|64\|128` | `0` | `0` = auto (`64 GiB` for &le;64 GiB VRAM, `128 GiB` for &gt;64 GiB VRAM). |
+| `cmp_magicd_a100=0\|1` | `0` | `1` = also clear extra A100 parity bits (`0x14480000`) in `PCIE_MAGIC_BITS_D` during volatile Gen4 override. |
+| `cmp_bdf=""` | `""` | Optional comma-separated PCI BDF filter (e.g. `0000:01:00.0`) limiting advanced options to specific GPUs. |
+
+### Install &amp; Configuration Examples
+
+```bash
+# 1. Conservative stock install (64GB/40GB, 74 SMs, Gen2 — plain cards):
+sudo ./install.sh
+
+# 2. Auto-enable everything supported per card (mixed plain + RIR + glitched rigs):
+sudo ./install.sh --auto
+
+# 3. Explicit fine-grained install:
+sudo ./install.sh --unlock-vram --unlock-sm --pcie-gen=4
+```
+
+You can also change options anytime without rebuilding by editing `/etc/modprobe.d/cmp-pcie-gen2.conf` and rebooting:
+
+```ini
+# Auto-enable everything supported per GPU:
+options nvidia NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x15" cmp_auto=1
+
+# Or target a specific GPU only (e.g. 0000:01:00.0 at Gen4 + SW-IFF SMs, leaving other GPUs stock):
+options nvidia NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x15" cmp_unlock_sm=1 cmp_max_pcie_gen=4 cmp_bdf="0000:01:00.0"
+```
+
+### Verification
+
+```bash
+sudo ./verify.sh                           # Check unlocked VRAM, module options, dmesg, and PCIe link speed
+sudo ./tools/service.sh verify             # Check authoritative live PCIe LnkSta speed & width per GPU
+sudo ./tools/swiff-unlock.sh status        # Show active cmp_* module params, driver binding, and link speed
+sudo dmesg | grep -E 'SEC2_DEBUG|CMP '     # Inspect geometry, SM-RECONFIG activeSMs, SW-IFF, BAR1, and PCIe logs
+```
+
+> **Note on PCIe Gen4 reporting:** `nvidia-smi` caches `LnkCap` from early boot and may display `Gen3` even when the link is trained at `16.0 GT/s`. Use `sudo ./tools/service.sh verify`, `sudo lspci -vv`, or `/sys/bus/pci/devices/<bdf>/current_link_speed` for the authoritative live link speed.
+
+### SW-IFF Helper (`tools/swiff-unlock.sh`)
+
+For RIR-unlocked cards (`DISABLE_SW_OVERRIDE_STATUS=0`), `0x8200E0`/`0x8200F4` PLMs start closed on a cold boot and are opened during the first GSP boot by `cmpunlocker`. Enabling `cmp-swiff.service` (installed automatically with `--auto` or `--unlock-sm`, or manually via `sudo ./tools/swiff-unlock.sh install-service`) performs a one-time unbind/rebind of only those GPUs that reported closed cold-boot PLMs so `nvidia.ko` arms SW-IFF + single-shot FLR automatically — no external script is needed for normal boot operation.
+
+```bash
+sudo ./tools/swiff-unlock.sh status                 # Show GPUs, module params, and link speeds
+sudo ./tools/swiff-unlock.sh inspect 0000:01:00.0   # Read-only defect/floorplan report (GPU must be unbound)
+```
+
+For manual userspace SW-IFF arm/undo outside the driver, point `IFF_APPLY` at `iff_apply.py` from [scrameta/iff_apply](https://github.com/scrameta/iff_apply):
+
+```bash
+sudo IFF_APPLY=/path/to/iff_apply.py ./tools/swiff-unlock.sh arm 0000:01:00.0 --flr
+sudo IFF_APPLY=/path/to/iff_apply.py ./tools/swiff-unlock.sh undo 0000:01:00.0 --flr
+```
 
 ---
 

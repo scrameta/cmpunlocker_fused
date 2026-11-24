@@ -70,7 +70,10 @@ rm -f /etc/modprobe.d/cmp-pcie-gen2.conf
 systemctl disable --now gen2.service 2>/dev/null || true
 systemctl reset-failed gen2.service 2>/dev/null || true
 rm -f /etc/systemd/system/gen2.service /usr/local/sbin/gen2-hammer
-ok "Removed PCIe Gen2 helpers"
+systemctl disable --now cmp-swiff.service 2>/dev/null || true
+systemctl reset-failed cmp-swiff.service 2>/dev/null || true
+rm -f /etc/systemd/system/cmp-swiff.service /usr/local/sbin/cmp-swiff-unlock
+ok "Removed PCIe and SW-IFF helpers"
 
 info "Removing VM passthrough helpers"
 systemctl disable --now cmpunlocker-passthrough.service 2>/dev/null || true

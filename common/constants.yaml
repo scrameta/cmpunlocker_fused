@@ -62,10 +62,38 @@ unlocks:
   memory_geometry:
     patch: sec2-postbl-plm-ss-cfg.patch
     registers:
-      fbpa_cfg1: { addr: "0x009a0204" }
-      ltc_lmr:   { addr: "0x00100ce0" }
-      wpr2_lo:   { addr: "0x001fa824" }
-      wpr2_hi:   { addr: "0x001fa828" }
+      fbpa_cfg1:       { addr: "0x009a0204" }
+      fbpa_num_active: { addr: "0x009a0164" }
+      ltc_lmr:         { addr: "0x00100ce0" }
+      wpr2_lo:         { addr: "0x001fa824" }
+      wpr2_hi:         { addr: "0x001fa828" }
+      status_opt_fbp:  { addr: "0x00820d38" }
+      status_opt_fbpa: { addr: "0x00820c18" }
+      status_opt_fbio: { addr: "0x00820c14" }
+
+  cmp_fused_probe:
+    patch: cmp-fused-probe.patch
+    registers:
+      fusectrl:          { addr: "0x00820000" }
+      fuseaddr:          { addr: "0x00820004" }
+      fuserdata:         { addr: "0x00820008" }
+      fusewdata:         { addr: "0x0082000c" }
+      en_sw_override:    { addr: "0x00820040" }
+      iff_record:        { addr: "0x00820050" }
+      dsov_status:       { addr: "0x00820084" }
+      iff_sw_fusing:     { addr: "0x00820088" }
+      debugctrl_plm:     { addr: "0x008200e0" }
+      fusewdata_plm:     { addr: "0x008200f4" }
+      opt_disable_gen3:  { addr: "0x00820250" }
+      opt_gpc_disable:   { addr: "0x00820350" }
+      opt_fbp_disable:   { addr: "0x00820364" }
+      opt_magic_d:       { addr: "0x00820520" }
+      opt_boot_gen3_dis: { addr: "0x00820580" }
+      opt_gpc_defective: { addr: "0x008205c4" }
+      opt_fbp_defective: { addr: "0x008205cc" }
+      opt_pes_disable:   { addr: "0x00820690" }
+      opt_pes_defective: { addr: "0x00820698" }
+      opt_tpc_gpc0_dis:  { addr: "0x00820760" }
 
   pcie_gen2:
     patch: pcie-gen2.patch
@@ -79,9 +107,13 @@ unlocks:
       priv_misc_1:         { addr: "0x0008841c" }
       vsec_device:         { addr: "0x0008860c" }
       vsec_hierarchy:      { addr: "0x00088610" }
+      gen4_phy_ce0:        { addr: "0x00088ce0" }
+      gen4_phy_ce4:        { addr: "0x00088ce4", value: "0x00000014" }
+      dl_manager:          { addr: "0x0008b8c0" }
       xp3g_status_base:    { addr: "0x0008e100" }
       xp3g_override_base:  { addr: "0x0008e110" }
       xp3g_value_base:     { addr: "0x0008e120" }
+      opt_disable_gen3:    { addr: "0x00820250" }
       opt_gen23:           { addr: "0x0082057c" }
       opt_gen3:            { addr: "0x00820580" }
       opt_magic:           { addr: "0x00820520" }
@@ -92,6 +124,8 @@ unlocks:
       link_config_0: { addr: "0x8c040" }
       fuse_override: { addr: "0x8872c" }
       pl_cya_0:      { addr: "0x8c2c0" }
+      gen4_phy_ce0:  { addr: "0x88ce0" }
+      gen4_phy_ce4:  { addr: "0x88ce4" }
 
   bar1_resize:
     patch: bar1-resize-unlock.patch

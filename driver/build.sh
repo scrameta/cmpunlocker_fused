@@ -52,6 +52,7 @@ PATCH_ORDER=(
     bar0-pramin-clamp.patch
     ce-scrub-workarounds.patch
     persistent-sw-state.patch
+    cmp-fused-probe.patch
     pcie-gen2.patch
     pcie-gen2-probe-retrain.patch
     name-string.patch

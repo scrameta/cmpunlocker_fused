@@ -58,9 +58,42 @@ is_pci_bridge() {
     [[ "${class,,}" == 0x0604* ]]
 }
 
+link_cap_generation() {
+    local cap
+    cap="$(setpci -s "$1" CAP_EXP+0c.w 2>/dev/null || true)"
+    if [[ "${cap}" =~ ^[[:xdigit:]]{4}$ ]]; then
+        echo $((0x${cap} & 0x0f))
+    else
+        echo "0"
+    fi
+}
+
+gen3_or_higher_enabled() {
+    local v=""
+    if [[ -r /sys/module/nvidia/parameters/cmp_max_pcie_gen ]]; then
+        v="$(tr -d '\n' < /sys/module/nvidia/parameters/cmp_max_pcie_gen 2>/dev/null || true)"
+        if [[ "${v}" =~ ^[0-9]+$ ]] && (( v >= 3 )); then
+            return 0
+        fi
+        if [[ "${v}" == "2" ]]; then
+            return 1
+        fi
+    fi
+    if [[ -r /sys/module/nvidia/parameters/cmp_auto ]]; then
+        v="$(tr -d '\n' < /sys/module/nvidia/parameters/cmp_auto 2>/dev/null || true)"
+        if [[ "${v}" == "1" ]]; then
+            return 0
+        fi
+    fi
+    if grep -Eqs '(^|[[:space:]])(cmp_auto=1|cmp_max_pcie_gen=[34])([[:space:]]|$)' /etc/modprobe.d/*.conf 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 retrain_one() {
     local gpu="$1"
-    local bridge status generation cap2 iteration initial
+    local bridge status generation cap2 iteration initial cap_gen
 
     if ! is_supported_gpu "${gpu}"; then
         log "${gpu}: vendor/device guard failed; refusing to touch the device"
@@ -75,6 +108,11 @@ retrain_one() {
     initial="$(link_generation "${gpu}")"
     if [[ "${initial}" =~ ^[0-9]+$ ]] && (( initial >= TARGET_GEN )); then
         log "${gpu}: already Gen${initial}; no retrain needed"
+        return 0
+    fi
+    cap_gen="$(link_cap_generation "${gpu}")"
+    if [[ "${cap_gen}" =~ ^[0-9]+$ ]] && (( cap_gen >= 3 )) && gen3_or_higher_enabled; then
+        log "${gpu}: LnkCap is Gen${cap_gen} with Gen3/Gen4 driver options enabled; skipping Gen2 hammer"
         return 0
     fi
 
