@@ -60,6 +60,34 @@ def test_conservative_defaults_in_probe_patch():
     assert "+int cmp_bar1_gb = 0;" in text
 
 
+def test_p2p_patch_trap30_ordering_and_safety():
+    raw = (repo.ROOT / "driver" / "patches" / "p2p-unlock.patch").read_text()
+    assert "+int cmp_p2p = 1;" in raw
+    text = raw.lower()
+    m = re.search(r"p2ptable\[\]\s*=\s*\{(.*?)\};", text, re.S)
+    assert m, "p2pTable[] not found in p2p-unlock.patch"
+    table = m.group(1)
+    # Must install PLM, trap PLM, match, mask, data1, data2, cfg strictly before arming trap 30 action.
+    expected_order = [
+        "0x0013affc",  # P2P_PLM
+        "0x00122778",  # P2P_TRAP_PLM (trap 30)
+        "0x00122478",  # P2P_TRAP_MATCH
+        "0x001224f8",  # P2P_TRAP_MASK
+        "0x00122578",  # P2P_TRAP_DATA1
+        "0x001225f8",  # P2P_TRAP_DATA2
+        "0x001226f8",  # P2P_TRAP_CFG
+        "0x00122678",  # P2P_TRAP_ACTION (must be last in p2pTable)
+    ]
+    positions = [table.index(addr) for addr in expected_order]
+    assert positions == sorted(positions), "p2pTable must arm TRAP_ACTION strictly last"
+    # Must never touch trap 31 (0x12247c / 0x12267c / 0x12277c), reserved for IFF requester.
+    for trap31 in ("12247c", "1224fc", "12257c", "1225fc", "12267c", "1226fc", "12277c"):
+        assert trap31 not in text, "must not touch SYS trap 31 (%s)" % trap31
+    # Must verify 0x00821030 readback == 0 and disarm 0x00122678 with 0 on failure.
+    assert "0x00821030u" in text
+    assert "gpu_reg_wr32(pgpu, 0x00122678u, 0x00000000u)" in text
+
+
 def test_build_sh_runtime_geometry_markers_present():
     text = (repo.ROOT / "driver" / "patches" / "sec2-postbl-plm-ss-cfg.patch").read_text()
     for marker in (

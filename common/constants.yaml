@@ -192,3 +192,16 @@ unlocks:
       fb_stop_clear:    { addr: "0x0010a7e4" }
       gfw_boot:         { addr: "0x00118234" }
       gsp_riscv_status: { addr: "0x00111240" }
+
+  p2p_unlock:
+    patch: p2p-unlock.patch
+    registers:
+      p2p_plm:         { addr: "0x0013affc", value: "0xffffffff" }
+      p2p_secure_opt:  { addr: "0x00821030" }
+      p2p_trap_plm:    { addr: "0x00122778", value: "0xfffffb9f" }
+      p2p_trap_match:  { addr: "0x00122478", value: "0x00821030" }
+      p2p_trap_mask:   { addr: "0x001224f8", value: "0xfc000000" }
+      p2p_trap_data1:  { addr: "0x00122578", value: "0x00000000" }
+      p2p_trap_data2:  { addr: "0x001225f8", value: "0x00000000" }
+      p2p_trap_cfg:    { addr: "0x001226f8", value: "0x0003c060" }
+      p2p_trap_action: { addr: "0x00122678", value: "0x00000011" }

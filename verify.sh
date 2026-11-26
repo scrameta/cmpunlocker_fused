@@ -121,7 +121,7 @@ done
 
 step "Checking unlock logs and installed profile"
 if [[ -r /sys/module/nvidia/parameters/cmp_auto ]]; then
-    info "Active nvidia cmp_* options: cmp_auto=$(cat /sys/module/nvidia/parameters/cmp_auto 2>/dev/null) cmp_unlock_vram=$(cat /sys/module/nvidia/parameters/cmp_unlock_vram 2>/dev/null) cmp_unlock_sm=$(cat /sys/module/nvidia/parameters/cmp_unlock_sm 2>/dev/null) cmp_max_pcie_gen=$(cat /sys/module/nvidia/parameters/cmp_max_pcie_gen 2>/dev/null) cmp_bar1_gb=$(cat /sys/module/nvidia/parameters/cmp_bar1_gb 2>/dev/null) cmp_p8_low_power=$(cat /sys/module/nvidia/parameters/cmp_p8_low_power 2>/dev/null || echo '?') cmp_p8_vbios=$(cat /sys/module/nvidia/parameters/cmp_p8_vbios 2>/dev/null || echo '?') cmp_hbm_governor=$(cat /sys/module/nvidia/parameters/cmp_hbm_governor 2>/dev/null || echo '?') cmp_p8_min_mhz=$(cat /sys/module/nvidia/parameters/cmp_p8_min_mhz 2>/dev/null || echo '?') cmp_hbm_idle_ms=$(cat /sys/module/nvidia/parameters/cmp_hbm_idle_ms 2>/dev/null || echo '?')"
+    info "Active nvidia cmp_* options: cmp_auto=$(cat /sys/module/nvidia/parameters/cmp_auto 2>/dev/null) cmp_unlock_vram=$(cat /sys/module/nvidia/parameters/cmp_unlock_vram 2>/dev/null) cmp_unlock_sm=$(cat /sys/module/nvidia/parameters/cmp_unlock_sm 2>/dev/null) cmp_max_pcie_gen=$(cat /sys/module/nvidia/parameters/cmp_max_pcie_gen 2>/dev/null) cmp_bar1_gb=$(cat /sys/module/nvidia/parameters/cmp_bar1_gb 2>/dev/null) cmp_p2p=$(cat /sys/module/nvidia/parameters/cmp_p2p 2>/dev/null || echo '?') cmp_p8_low_power=$(cat /sys/module/nvidia/parameters/cmp_p8_low_power 2>/dev/null || echo '?') cmp_p8_vbios=$(cat /sys/module/nvidia/parameters/cmp_p8_vbios 2>/dev/null || echo '?') cmp_hbm_governor=$(cat /sys/module/nvidia/parameters/cmp_hbm_governor 2>/dev/null || echo '?') cmp_p8_min_mhz=$(cat /sys/module/nvidia/parameters/cmp_p8_min_mhz 2>/dev/null || echo '?') cmp_hbm_idle_ms=$(cat /sys/module/nvidia/parameters/cmp_hbm_idle_ms 2>/dev/null || echo '?')"
     p_auto="$(cat /sys/module/nvidia/parameters/cmp_auto 2>/dev/null || echo 0)"
     p8_lp="$(cat /sys/module/nvidia/parameters/cmp_p8_low_power 2>/dev/null || echo -1)"
     p8_vb="$(cat /sys/module/nvidia/parameters/cmp_p8_vbios 2>/dev/null || echo -1)"
@@ -138,13 +138,25 @@ if [[ -r /sys/module/nvidia/parameters/cmp_auto ]]; then
         fi
     fi
 fi
-sec2_logs="$(dmesg 2>/dev/null | grep -E 'SEC2_DEBUG|CMP (SW-IFF|fuse|PCIe|BAR1|P8|HBM)' || true)"
+sec2_logs="$(dmesg 2>/dev/null | grep -E 'SEC2_DEBUG|CMP (SW-IFF|fuse|PCIe|BAR1|P2P|P8|HBM)' || true)"
 if [[ -n "${sec2_logs}" ]]; then
     ok "dmesg contains CMP unlock logs"
     info "Sample:"
     printf '%s\n' "${sec2_logs}" | tail -n 12 | sed 's/^/  /'
 else
     warn "No SEC2_DEBUG lines in dmesg (logs may have rotated; unlock can still be OK if memory is unlocked)"
+fi
+
+if (( ${#GPU_BDFS[@]} >= 2 )); then
+    p2p_r="$(nvidia-smi topo -p2p r 2>/dev/null || true)"
+    if [[ -n "${p2p_r}" ]]; then
+        info "PCIe P2P read topology (nvidia-smi topo -p2p r):"
+        printf '%s\n' "${p2p_r}" | sed 's/^/  /'
+        if printf '%s\n' "${p2p_r}" | grep -qw 'CNS'; then
+            info "CNS (Chipset Not Supported): GPU-side P2P is unlocked, but the chipset is not in NVIDIA's allowlist."
+            info "To override on a verified peer-routing platform, append ForceP2P=0x11 to NVreg_RegistryDwords (or run install.sh --force-p2p)."
+        fi
+    fi
 fi
 
 echo ""

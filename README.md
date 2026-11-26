@@ -136,6 +136,10 @@ Then perform a reboot.
     <td>Working (<code>cmp_bar1_gb=0|64|128</code>) ✓</td>
   </tr>
   <tr>
+    <td>Native PCIe P2P (mailbox PLM + secure-option override)</td>
+    <td>Working (<code>cmp_p2p=1</code> default) ✓</td>
+  </tr>
+  <tr>
     <td>Zagitta P8 low-power mode (P8 VBIOS idle core clocks + HBM idle clock governor, ~40W &rarr; ~23W idle)</td>
     <td>Opt-in (<code>cmp_p8_low_power=1</code> / <code>cmp_auto=1</code>) ✓</td>
   </tr>
@@ -148,7 +152,7 @@ Then perform a reboot.
 Every GPU (`10de:20c2` / `10de:2082`) is evaluated independently at runtime based on:
 1. **Live fuse state** (`DISABLE_SW_OVERRIDE_STATUS`, PCIe speed fuses, active coherent FBPs),
 2. **Hardware defect floorplan** (`OPT_*_DEFECTIVE` — factory-defective silicon is never unmasked), and
-3. **Kernel module options** (conservative defaults: plain 64GB/40GB, 74 SMs, PCIe Gen2).
+3. **Kernel module options** (conservative defaults: plain 64GB/40GB, 74 SMs, PCIe Gen2, native PCIe P2P).
 
 > **Zero OTP / No Fuse Burning:** Neither the patched driver nor any helper script in this repository writes `FUSECTRL CMD_WRITE` or `DEBUGCTRL`. All SW-IFF writes target the volatile SRAM overlay via `IFF_SW_FUSING (0x820088)` and disappear on power cycle.
 
@@ -156,10 +160,10 @@ Every GPU (`10de:20c2` / `10de:2082`) is evaluated independently at runtime base
 
 | Card State | Conservative Default (`sudo ./install.sh`) | Auto Mode (`sudo ./install.sh --auto` / `cmp_auto=1`) |
 |---|---|---|
-| Plain stock 8 GB (`0x20C2`, `DSOV=1`) | 64 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2 | 64 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2, **P8 low-power (~23W idle)** |
-| Plain stock 10 GB (`0x2082`, `DSOV=1`) | 40 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2 | 40 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2, **P8 low-power (~23W idle)** |
-| RIR-unlocked 10 GB (`0x2082`, `DSOV=0`) | 40 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2 | 40 GiB (or 48 GiB if 12 non-defective FBPs), 64 GiB BAR1, all non-defective SMs via SW-IFF (up to 128), PCIe Gen4 (or host slot max), **P8 low-power (~23W idle)** |
-| Glitched / FF-burned 8 GB (`0x20C2`, 10 FBPs, Gen4 fuses) | 64 GiB, 64 GiB BAR1, burned SMs + RECONFIG, PCIe Gen2 | **80 GiB**, **128 GiB BAR1**, all non-defective SMs + RECONFIG, **PCIe Gen4** (or host slot max), **P8 low-power (~23W idle)** |
+| Plain stock 8 GB (`0x20C2`, `DSOV=1`) | 64 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2, Native P2P | 64 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2, Native P2P, **P8 low-power (~23W idle)** |
+| Plain stock 10 GB (`0x2082`, `DSOV=1`) | 40 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2, Native P2P | 40 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2, Native P2P, **P8 low-power (~23W idle)** |
+| RIR-unlocked 10 GB (`0x2082`, `DSOV=0`) | 40 GiB, 64 GiB BAR1, 74 SMs, PCIe Gen2, Native P2P | 40 GiB (or 48 GiB if 12 non-defective FBPs), 64 GiB BAR1, all non-defective SMs via SW-IFF (up to 128), PCIe Gen4 (or host slot max), Native P2P, **P8 low-power (~23W idle)** |
+| Glitched / FF-burned 8 GB (`0x20C2`, 10 FBPs, Gen4 fuses) | 64 GiB, 64 GiB BAR1, burned SMs + RECONFIG, PCIe Gen2, Native P2P | **80 GiB**, **128 GiB BAR1**, all non-defective SMs + RECONFIG, **PCIe Gen4** (or host slot max), **Native P2P**, **P8 low-power (~23W idle)** |
 
 ### Kernel Module Options
 
@@ -171,6 +175,7 @@ Every GPU (`10de:20c2` / `10de:2082`) is evaluated independently at runtime base
 | `cmp_max_pcie_gen=-1\|2\|3\|4` | `-1` | `-1` = follow `cmp_auto` (`2` conservative, `4` auto). Caps per-card PCIe target by card fuses and host root-port `LnkCap`. |
 | `cmp_pcie_retrain=0\|1` | `1` | `1` = automatic staged single-shot link retrain (`Gen1 -> 2 -> 3 [-> 4]`) during init. `0` = apply PHY init only (manual retrain). |
 | `cmp_bar1_gb=0\|64\|128` | `0` | `0` = auto (`64 GiB` for &le;64 GiB VRAM, `128 GiB` for &gt;64 GiB VRAM). |
+| `cmp_p2p=0\|1` | `1` | `1` = enable native PCIe mailbox P2P unlock (`0x0013affc` PLM + SYS decode trap 30 overriding `0x00821030`). `0` = disable. |
 | `cmp_magicd_a100=0\|1` | `0` | `1` = also clear extra A100 parity bits (`0x14480000`) in `PCIE_MAGIC_BITS_D` during volatile Gen4 override. |
 | `cmp_p8_low_power=-1\|0\|1` | `-1` | `-1` = follow `cmp_auto` (off by default, **on with `--auto`**). `0` = disable both P8 VBIOS override and HBM governor. `1` = enable [Zagitta](https://github.com/Zagitta/gpu-unlock) P8 low-power mode (`~40W -> ~23W` idle across 8/10/12-FBP cards). |
 | `cmp_p8_vbios=-1\|0\|1` | `-1` | `-1` = follow `cmp_p8_low_power`. `0` = disable P8 VBIOS override. `1` = enable boot-generated P8 VBIOS override (`romOverride00`/`01`, factory P0 preserved, never flashed to ROM). |
@@ -179,25 +184,45 @@ Every GPU (`10de:20c2` / `10de:2082`) is evaluated independently at runtime base
 | `cmp_hbm_idle_ms=N` | `5000` | Quiet time in milliseconds before the HBM governor lowers the HBM clock (default `5000` ms to avoid transition churn during LLM model loads; minimum `100` ms). |
 | `cmp_bdf=""` | `""` | Optional comma-separated PCI BDF filter (e.g. `0000:01:00.0`) limiting advanced options (including P8 low-power mode) to specific GPUs. |
 
+### Native PCIe P2P
+
+Native PCIe mailbox P2P (ported from [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) 3.0 and validated on 64/80 GiB CMP 170HX hosts in [satspace-cpu/cmp170hx-linux-p2p](https://github.com/satspace-cpu/cmp170hx-linux-p2p)) is enabled by default (`cmp_p2p=1`). During GSP boot, the SEC2 Booter opens the P2P mailbox PLM (`0x0013affc`) and configures SYS PRI decode trap 30 (`0x00122478`–`0x00122778`) to override reads of the secure P2P disable option (`0x00821030`) to `0`, disarming trap 30 automatically if the readback check fails. It works with both 40/64 GiB and 80/96 GiB cards without Static BAR1 (`RMForceStaticBar1` / `RMPcieP2PType` are **not** required and should not be used with 80 GiB cards).
+
+Check both directions after reboot:
+
+```bash
+sudo ./tools/check-p2p.sh
+nvidia-smi topo -p2p r
+nvidia-smi topo -p2p w
+```
+
+- **`OK`**: Native P2P is active. Verify actual peer data integrity (peer copies + SM remote loads/stores, e.g. `p2p-integrity`) and measure with `p2pBandwidthLatencyTest`.
+- **`GNS`** (GPU not supported): Check `sudo dmesg | grep 'CMP P2P'` and verify `cmp_p2p=1`.
+- **`CNS`** (Chipset not supported): The GPU side is unlocked, but NVIDIA's chipset allowlist does not recognize the motherboard. On platforms whose root complex actually routes peer traffic, pass `--force-p2p` to `install.sh` (or append `;ForceP2P=0x11` inside `NVreg_RegistryDwords` in `/etc/modprobe.d/cmp-pcie-gen2.conf`) and reboot. `ForceP2P=0x11` bypasses all driver P2P checks (enabling reads and writes while leaving atomics off), so only use it when all GPUs are P2P-unlocked and always run a content integrity test afterward.
+- **IOMMU & ACS note:** P2P throughput and reachability depend on PCIe topology (same root complex / PCIe switch), ACS settings, and IOMMU mode (`iommu=pt` or `iommu=off` on bare metal).
+
 ### Install &amp; Configuration Examples
 
 ```bash
-# 1. Conservative stock install (64GB/40GB, 74 SMs, Gen2, no P8 low-power):
+# 1. Conservative stock install (64GB/40GB, 74 SMs, Gen2, Native P2P, no P8 low-power):
 sudo ./install.sh
 
 # 2. Auto-enable everything supported per card (includes Zagitta P8 low-power, ~40W -> ~23W idle):
 sudo ./install.sh --auto
 
-# 3. Auto unlocks WITHOUT P8 low-power mode:
+# 3. Auto-enable + ForceP2P=0x11 on CNS motherboards:
+sudo ./install.sh --auto --force-p2p
+
+# 4. Auto unlocks WITHOUT P8 low-power mode:
 sudo ./install.sh --auto --no-p8-low-power
 
-# 4. Auto unlocks with P8 VBIOS idle core clocks only (disabling HBM stop_machine() governor):
+# 5. Auto unlocks with P8 VBIOS idle core clocks only (disabling HBM stop_machine() governor):
 sudo ./install.sh --auto --no-hbm-governor
 
-# 5. Plain card with ONLY Zagitta P8 low-power mode (64GB/40GB, Gen2, ~23W idle):
+# 6. Plain card with ONLY Zagitta P8 low-power mode (64GB/40GB, Gen2, ~23W idle):
 sudo ./install.sh --p8-low-power
 
-# 6. Explicit fine-grained install with 30 s HBM idle window (e.g. for vLLM):
+# 7. Explicit fine-grained install with 30 s HBM idle window (e.g. for vLLM):
 sudo ./install.sh --unlock-vram --unlock-sm --pcie-gen=4 --p8-low-power --hbm-idle-ms=30000
 ```
 
@@ -220,10 +245,11 @@ options nvidia NVreg_RegistryDwords="RmForceEnableGen2=1;RMPcieLinkSpeed=0x15" c
 ### Verification
 
 ```bash
-sudo ./verify.sh                           # Check unlocked VRAM, module options, P8/HBM telemetry, dmesg, and PCIe link speed
+sudo ./verify.sh                           # Check unlocked VRAM, module options, P8/HBM telemetry, P2P, dmesg, and PCIe link speed
+sudo ./tools/check-p2p.sh                  # Read-only PCIe P2P, IOMMU, ACS, BAR1, and link speed diagnostics
 sudo ./tools/service.sh verify             # Check authoritative live PCIe LnkSta speed & width per GPU
 sudo ./tools/swiff-unlock.sh status        # Show active cmp_* module params, driver binding, and link speed
-sudo dmesg | grep -E 'SEC2_DEBUG|CMP '     # Inspect geometry, SM-RECONFIG activeSMs, SW-IFF, BAR1, PCIe, P8, and HBM logs
+sudo dmesg | grep -E 'SEC2_DEBUG|CMP '     # Inspect geometry, SM-RECONFIG activeSMs, SW-IFF, BAR1, P2P, PCIe, P8, and HBM logs
 ```
 
 > **Note on PCIe Gen4 reporting:** `nvidia-smi` caches `LnkCap` from early boot and may display `Gen3` even when the link is trained at `16.0 GT/s`. Use `sudo ./tools/service.sh verify`, `sudo lspci -vv`, or `/sys/bus/pci/devices/<bdf>/current_link_speed` for the authoritative live link speed.
