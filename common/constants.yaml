@@ -177,6 +177,22 @@ unlocks:
     patch: ecc-reporting.patch
     registers: {}
 
+  p8_low_power:
+    patch: p8-low-power.patch
+    registers:
+      fbpa_config_plm:  { addr: "0x009a0168", value: "0xffffffff" }
+      fbpa_hbmpll_plm:  { addr: "0x009a3c7c", value: "0xffffffff" }
+      fbpa_base:        { addr: "0x00900000" }
+      pll_cfg_mc2:      { addr: "0x0098bc90" }
+      pll_coeff_mc2:    { addr: "0x0098bc98" }
+      pri_fence:        { addr: "0x001211fc" }
+      fb_stop_output:   { addr: "0x0010a7c0" }
+      fb_stop_input:    { addr: "0x0010a7c4" }
+      fb_stop_set:      { addr: "0x0010a7e0" }
+      fb_stop_clear:    { addr: "0x0010a7e4" }
+      gfw_boot:         { addr: "0x00118234" }
+      gsp_riscv_status: { addr: "0x00111240" }
+
   p2p_unlock:
     patch: p2p-unlock.patch
     registers:

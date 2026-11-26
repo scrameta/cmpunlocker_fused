@@ -61,6 +61,7 @@ PATCH_ORDER=(
     ecc-enable.patch
     ecc-fbpa-static.patch
     ecc-reporting.patch
+    p8-low-power.patch
     p2p-unlock.patch
 )
 PATCH_FILES=()

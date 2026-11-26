@@ -1,6 +1,47 @@
+--- a/kernel-open/nvidia/nv-pci.c
++++ b/kernel-open/nvidia/nv-pci.c
+@@ -70,6 +70,7 @@ int cmp_p8_low_power = -1;
+ int cmp_p8_vbios = -1;
+ int cmp_hbm_governor = -1;
+ int cmp_p8_min_mhz = 135;
+ int cmp_hbm_idle_ms = 5000;
++int cmp_p2p = 1;
+ char *cmp_bdf = "";
+ 
+ module_param(cmp_auto, int, 0444);
+@@ -108,6 +109,9 @@ module_param(cmp_p8_min_mhz, int, 0444);
+ module_param(cmp_hbm_idle_ms, int, 0444);
+ MODULE_PARM_DESC(cmp_hbm_idle_ms,
+     "CMP 170HX: quiet time in ms before HBM governor drops to 540 MHz idle profile (default: 5000, min: 100)");
++module_param(cmp_p2p, int, 0444);
++MODULE_PARM_DESC(cmp_p2p,
++    "CMP 170HX: native PCIe mailbox P2P unlock via P2P PLM + SYS decode trap 30 (1=enabled default, 0=disabled)");
+ module_param(cmp_bdf, charp, 0444);
+ MODULE_PARM_DESC(cmp_bdf,
+     "CMP 170HX: comma-separated PCI BDF filter for advanced unlocks, e.g. 0000:01:00.0 (empty=all CMP 170HX GPUs)");
+@@ -129,6 +133,7 @@ int cmp170hx_want_hbm_governor(unsigned int domain, unsigned int bus,
+                                unsigned int dev, unsigned int fn);
+ int cmp170hx_get_p8_min_mhz(void);
+ unsigned int cmp170hx_get_hbm_idle_ms(void);
++int cmp170hx_want_p2p(void);
+ 
+ int cmp170hx_bdf_matches(unsigned int domain, unsigned int bus,
+                          unsigned int dev, unsigned int fn)
+@@ -262,6 +267,11 @@ unsigned int cmp170hx_get_hbm_idle_ms(void)
+     return (unsigned int)cmp_hbm_idle_ms;
+ }
+ 
++int cmp170hx_want_p2p(void)
++{
++    return (cmp_p2p != 0) ? 1 : 0;
++}
++
+ #include "nv-cmp-hbm.h"
+ 
+ #define CMP_FUSE_MAP_SIZE              0x00830000U
 --- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
 +++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
-@@ -5981,6 +5981,105 @@
+@@ -6046,6 +6046,105 @@
                        PCIE_LINK_SPEED_OF(statAfter));
          }
  

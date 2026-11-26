@@ -1,0 +1,1682 @@
+diff --git a/kernel-open/nvidia/nv-cmp-hbm.h b/kernel-open/nvidia/nv-cmp-hbm.h
+new file mode 100644
+index 0000000..908e2b0
+--- /dev/null
++++ b/kernel-open/nvidia/nv-cmp-hbm.h
+@@ -0,0 +1,972 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-only
++ *
++ * GA100 / CMP 170HX HBM idle clock governor.
++ *
++ * Ported from Zagitta/gpu-unlock (kernel/gpu_unlock/hbm.h, hbm.c, hbm_work.c)
++ * including PR #373 hardening (stop_machine() CPU hold during FB-stop clock
++ * switches, bounded PLL lock polls, 5 s default idle delay, and 1 s retry
++ * backoff on switch errors).
++ */
++#ifndef NV_CMP_HBM_H
++#define NV_CMP_HBM_H
++
++#ifdef __KERNEL__
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/io.h>
++#include <linux/ktime.h>
++#include <linux/limits.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/pci.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++#include <linux/stop_machine.h>
++#include <linux/string.h>
++#include <linux/suspend.h>
++#include <linux/workqueue.h>
++#include <uapi/linux/pci_regs.h>
++#endif
++
++#define CMP_HBM_POLL_MS          20U
++#define CMP_HBM_RETRY_MS         1000U
++#define CMP_HBM_DEFAULT_IDLE_MS  5000U
++#define CMP_HBM_IDLE_NDIV        20U
++#define CMP_HBM_IDLE_PLDIV       1U
++#define CMP_HBM_IDLE_REFRESH     48U
++
++#define CMP_HBM_FBPA_BASE        0x00900000U
++#define CMP_HBM_FBPA_STRIDE      0x00004000U
++#define CMP_HBM_FBPA_CFG1        0x0204U
++#define CMP_HBM_REFRESH_PLM      0x0168U
++#define CMP_HBM_REFRESH          0x02a0U
++#define CMP_HBM_REFRESH_MASK     0x00007ff8U
++#define CMP_HBM_SOFTWARE_REF     0x0310U
++#define CMP_HBM_PLL_PLM          0x3c7cU
++#define CMP_HBM_PLL_CFG          0x3c90U
++#define CMP_HBM_PLL_COEFF        0x3c98U
++#define CMP_HBM_PLL_LOCK         0x20U
++#define CMP_HBM_PLL_BYPASS       0x400U
++#define CMP_HBM_NDIV_MASK        0xff00U
++#define CMP_HBM_PLDIV_MASK       0x3f0000U
++#define CMP_HBM_CLOCK_MASK       (CMP_HBM_NDIV_MASK | CMP_HBM_PLDIV_MASK)
++#define CMP_HBM_PLL_CFG_MC2      0x0098bc90U
++#define CMP_HBM_PLL_COEFF_MC2    0x0098bc98U
++#define CMP_HBM_PRI_FENCE        0x001211fcU
++#define CMP_HBM_FB_STOP_OUTPUT   0x0010a7c0U
++#define CMP_HBM_FB_STOP_INPUT    0x0010a7c4U
++#define CMP_HBM_FB_STOP_SET      0x0010a7e0U
++#define CMP_HBM_FB_STOP_CLEAR    0x0010a7e4U
++#define CMP_HBM_FB_STOP          (1U << 2)
++#define CMP_HBM_GFW_BOOT         0x00118234U
++#define CMP_HBM_GSP_RISCV_STATUS 0x00111240U
++#define CMP_HBM_PLM_HOST_WRITE   0x00000010U
++#define CMP_HBM_COUNT_MASK       0x7fffffffU
++/* Stay well below a 31-bit counter wrap even at the highest PMU clock. */
++#define CMP_HBM_MAX_SAMPLE_NS    1000000000ULL
++/* PLL locks within the first few settle reads; bound waits under stop_machine(). */
++#define CMP_HBM_SETTLE_READS     500U
++#define CMP_HBM_LOCK_POLLS       1000U
++
++enum cmp_hbm_mode {
++    CMP_HBM_AUTO = 0,
++    CMP_HBM_BUSY = 1,
++    CMP_HBM_IDLE = 2,
++};
++
++struct cmp_hbm_policy {
++    u32 ndiv, pldiv, refresh, idle_ms;
++    enum cmp_hbm_mode mode;
++};
++
++struct cmp_hbm_counter {
++    u32 mask[3], control, threshold, count, delta;
++};
++
++struct cmp_hbm {
++    struct cmp_hbm_policy policy;
++    struct cmp_hbm_counter counter[16];
++    u16 counters, active_counters;
++    u32 fbpas, first_fbpa, busy_coeff, idle_coeff, busy_refresh[24];
++    u64 sampled, quiet_since;
++    bool profile, baseline, idle, fb_stopped;
++    const char *reason;
++    u32 reg, value, coverage[3];
++};
++
++static const u32 cmp_hbm_counter_addr[5] = {
++    0x0010be40U, 0x0010be80U, 0x0010bec0U, 0x0010bfc0U, 0x0010be00U,
++};
++
++/* GR, all nine copy engines, and framebuffer requests. */
++static const u32 cmp_hbm_required[3] = {
++    0x00380081U, 0x00700000U, 0x00000007U,
++};
++
++static bool cmp_hbm_readable(u32 value)
++{
++    return value != ~0U && (value & 0xfff00000U) != 0xbad00000U;
++}
++
++static int cmp_hbm_problem(struct cmp_hbm *hbm, int error, const char *reason,
++                           u32 reg, u32 value)
++{
++    hbm->reason = reason;
++    hbm->reg = reg;
++    hbm->value = value;
++    return error;
++}
++
++static bool cmp_hbm_booted(void __iomem *bar)
++{
++    u32 boot = readl(bar + CMP_HBM_GFW_BOOT);
++    u32 gsp  = readl(bar + CMP_HBM_GSP_RISCV_STATUS);
++
++    return cmp_hbm_readable(boot) && cmp_hbm_readable(gsp) &&
++           (boot & 0xffU) == 0xffU &&
++           ((gsp & 7U) == 3U || (gsp & 7U) == 5U);
++}
++
++static void cmp_hbm_init(struct cmp_hbm *hbm, u32 idle_ms)
++{
++    memset(hbm, 0, sizeof(*hbm));
++    hbm->policy.ndiv    = CMP_HBM_IDLE_NDIV;
++    hbm->policy.pldiv   = CMP_HBM_IDLE_PLDIV;
++    hbm->policy.refresh = CMP_HBM_IDLE_REFRESH;
++    hbm->policy.idle_ms = (idle_ms >= 100U) ? idle_ms : CMP_HBM_DEFAULT_IDLE_MS;
++    hbm->policy.mode    = CMP_HBM_AUTO;
++}
++
++static void cmp_hbm_reset(struct cmp_hbm *hbm)
++{
++    hbm->baseline = false;
++    /* Keep the saved profile until idle settings and our stop are cleared. */
++    if (!hbm->idle && !hbm->fb_stopped)
++        hbm->profile = false;
++}
++
++static u32 cmp_hbm_fbpa(unsigned int index)
++{
++    return CMP_HBM_FBPA_BASE + index * CMP_HBM_FBPA_STRIDE;
++}
++
++static u32 cmp_hbm_idle_coeff(const struct cmp_hbm *hbm)
++{
++    return (hbm->busy_coeff & ~CMP_HBM_CLOCK_MASK) |
++           (hbm->policy.ndiv << 8) | (hbm->policy.pldiv << 16);
++}
++
++static int cmp_hbm_capture_profile(struct cmp_hbm *hbm, void __iomem *bar)
++{
++    u32 coeff, cfg, plm, mask = 0U, first = 0U;
++    unsigned int i;
++
++    for (i = 0; i < 24U; i++)
++    {
++        u32 base = cmp_hbm_fbpa(i);
++        u32 geometry = readl(bar + base + CMP_HBM_FBPA_CFG1);
++
++        if (!cmp_hbm_readable(geometry) || geometry == 0U)
++            continue;
++        plm = readl(bar + base + CMP_HBM_REFRESH_PLM);
++        if (!(plm & CMP_HBM_PLM_HOST_WRITE) || (plm & 0xfff00000U) == 0xbad00000U)
++            return cmp_hbm_problem(hbm, -EAGAIN, "refresh access closed",
++                                   base + CMP_HBM_REFRESH_PLM, plm);
++        hbm->busy_refresh[i] = readl(bar + base + CMP_HBM_REFRESH);
++        if (!cmp_hbm_readable(hbm->busy_refresh[i]) ||
++            !(hbm->busy_refresh[i] & CMP_HBM_REFRESH_MASK))
++            return cmp_hbm_problem(hbm, -EAGAIN, "invalid refresh",
++                                   base + CMP_HBM_REFRESH, hbm->busy_refresh[i]);
++        if (mask == 0U)
++            first = base;
++        mask |= 1U << i;
++    }
++    if (mask == 0U)
++        return cmp_hbm_problem(hbm, -EAGAIN, "no accessible memory controllers",
++                               CMP_HBM_FBPA_BASE + CMP_HBM_FBPA_CFG1, 0U);
++
++    cfg   = readl(bar + first + CMP_HBM_PLL_CFG);
++    coeff = readl(bar + first + CMP_HBM_PLL_COEFF);
++    plm   = readl(bar + first + CMP_HBM_PLL_PLM);
++    if (!cmp_hbm_readable(cfg) || (cfg & (CMP_HBM_PLL_LOCK | 1U)) != (CMP_HBM_PLL_LOCK | 1U) ||
++        (cfg & ((1U << 7) | (1U << 10))) != 0U)
++        return cmp_hbm_problem(hbm, -EAGAIN, "HBM PLL not ready",
++                               first + CMP_HBM_PLL_CFG, cfg);
++    if (!cmp_hbm_readable(coeff) || !(coeff & 0xffU) || !(coeff & 0x3f0000U))
++        return cmp_hbm_problem(hbm, -EAGAIN, "invalid HBM PLL coefficient",
++                               first + CMP_HBM_PLL_COEFF, coeff);
++    if (!(plm & CMP_HBM_PLM_HOST_WRITE) || (plm & 0xfff00000U) == 0xbad00000U)
++        return cmp_hbm_problem(hbm, -EAGAIN, "HBM PLL access closed",
++                               first + CMP_HBM_PLL_PLM, plm);
++
++    hbm->fbpas = mask;
++    hbm->first_fbpa = first;
++    hbm->busy_coeff = coeff;
++    hbm->idle_coeff = cmp_hbm_idle_coeff(hbm);
++    hbm->profile = true;
++    return 0;
++}
++
++/*
++ * Shorten refresh intervals before increasing the clock, lengthen them after
++ * decreasing it. Preserve every field outside the refresh interval.
++ */
++static int cmp_hbm_refresh(struct cmp_hbm *hbm, void __iomem *bar, bool idle, bool before)
++{
++    unsigned int i;
++
++    for (i = 0; i < 24U; i++)
++    {
++        u32 addr, value, target, old;
++
++        if (!(hbm->fbpas & (1U << i)))
++            continue;
++        addr = cmp_hbm_fbpa(i) + CMP_HBM_REFRESH;
++        value = readl(bar + addr);
++        if (!cmp_hbm_readable(value))
++            return cmp_hbm_problem(hbm, -EIO, "refresh read failed", addr, value);
++        old = value & CMP_HBM_REFRESH_MASK;
++        target = idle ? (hbm->policy.refresh << 3) : (hbm->busy_refresh[i] & CMP_HBM_REFRESH_MASK);
++        if (target == old || (target < old) != before)
++            continue;
++        writel((value & ~CMP_HBM_REFRESH_MASK) | target, bar + addr);
++        value = readl(bar + addr);
++        if (!cmp_hbm_readable(value) || (value & CMP_HBM_REFRESH_MASK) != target)
++            return cmp_hbm_problem(hbm, -EIO, "refresh readback mismatch", addr, value);
++    }
++    return 0;
++}
++
++/* MC2 addresses the VBIOS-configured serial-priv master group. */
++static void cmp_hbm_pll_write(void __iomem *bar, u32 reg, u32 value)
++{
++    writel(value, bar + reg);
++    writel(0U, bar + CMP_HBM_PRI_FENCE);
++    ndelay(20);
++}
++
++static int cmp_hbm_pll_wait(struct cmp_hbm *hbm, void __iomem *bar, u32 coeff,
++                            bool bypass, const char *phase)
++{
++    unsigned int i, poll;
++    u32 expected = CMP_HBM_PLL_LOCK | 1U | (bypass ? CMP_HBM_PLL_BYPASS : 0U);
++
++    for (i = 0; i < 24U; i++)
++    {
++        u32 reg = cmp_hbm_fbpa(i) + CMP_HBM_PLL_CFG;
++        u32 value = 0U;
++
++        if (!(hbm->fbpas & (1U << i)))
++            continue;
++        for (poll = 0; poll < CMP_HBM_LOCK_POLLS; poll++)
++        {
++            reg = cmp_hbm_fbpa(i) + CMP_HBM_PLL_CFG;
++            value = readl(bar + reg);
++            if (!cmp_hbm_readable(value) ||
++                (value & (CMP_HBM_PLL_LOCK | 1U | CMP_HBM_PLL_BYPASS | (1U << 7))) != expected)
++                continue;
++            reg = cmp_hbm_fbpa(i) + CMP_HBM_PLL_COEFF;
++            value = readl(bar + reg);
++            if (value == coeff)
++                break;
++        }
++        if (poll == CMP_HBM_LOCK_POLLS)
++            return cmp_hbm_problem(hbm, -ETIMEDOUT, phase, reg, value);
++    }
++    return 0;
++}
++
++static int cmp_hbm_set_clock(struct cmp_hbm *hbm, void __iomem *bar, bool idle)
++{
++    u32 old   = readl(bar + hbm->first_fbpa + CMP_HBM_PLL_COEFF);
++    u32 cfg   = readl(bar + hbm->first_fbpa + CMP_HBM_PLL_CFG);
++    u32 value = idle ? hbm->idle_coeff : hbm->busy_coeff;
++    bool bypass = ((old ^ value) & CMP_HBM_PLDIV_MASK) != 0U;
++    unsigned int i;
++    int ret;
++
++    if (old != hbm->busy_coeff && old != hbm->idle_coeff)
++        return cmp_hbm_problem(hbm, -EIO, "HBM PLL configuration changed",
++                               hbm->first_fbpa + CMP_HBM_PLL_COEFF, old);
++    if (!cmp_hbm_readable(cfg) ||
++        (cfg & (CMP_HBM_PLL_LOCK | 1U | CMP_HBM_PLL_BYPASS | (1U << 7))) != (CMP_HBM_PLL_LOCK | 1U))
++        return cmp_hbm_problem(hbm, -EIO, "HBM PLL not ready for transition",
++                               hbm->first_fbpa + CMP_HBM_PLL_CFG, cfg);
++    if (value == old)
++        return 0;
++
++    if (bypass)
++    {
++        cmp_hbm_pll_write(bar, CMP_HBM_PLL_CFG_MC2, cfg | CMP_HBM_PLL_BYPASS);
++        ret = cmp_hbm_pll_wait(hbm, bar, old, true, "HBM bypass entry timeout");
++        if (ret)
++            goto rollback;
++        udelay(2);
++    }
++    cmp_hbm_pll_write(bar, CMP_HBM_PLL_COEFF_MC2, value);
++    for (i = 0; i < CMP_HBM_SETTLE_READS; i++)
++        (void)readl(bar + hbm->first_fbpa + CMP_HBM_PLL_CFG);
++    ret = cmp_hbm_pll_wait(hbm, bar, value, bypass, "HBM PLL lock/coefficient timeout");
++    if (ret)
++        goto rollback;
++    if (bypass)
++    {
++        cmp_hbm_pll_write(bar, CMP_HBM_PLL_CFG_MC2, cfg);
++        udelay(2);
++        ret = cmp_hbm_pll_wait(hbm, bar, value, false, "HBM bypass exit timeout");
++        if (ret)
++            goto rollback;
++    }
++    return 0;
++
++rollback:
++    if (bypass)
++    {
++        cmp_hbm_pll_write(bar, CMP_HBM_PLL_CFG_MC2, cfg | CMP_HBM_PLL_BYPASS);
++        udelay(2);
++    }
++    cmp_hbm_pll_write(bar, CMP_HBM_PLL_COEFF_MC2, old);
++    for (i = 0; i < CMP_HBM_SETTLE_READS; i++)
++        (void)readl(bar + hbm->first_fbpa + CMP_HBM_PLL_CFG);
++    if (bypass)
++    {
++        cmp_hbm_pll_write(bar, CMP_HBM_PLL_CFG_MC2, cfg);
++        udelay(2);
++    }
++    return ret;
++}
++
++static int cmp_hbm_fb_wait(struct cmp_hbm *hbm, void __iomem *bar, bool stopped)
++{
++    u32 value = 0U;
++    unsigned int i;
++
++    for (i = 0; i < 1000U; i++)
++    {
++        value = readl(bar + CMP_HBM_FB_STOP_INPUT);
++        if (!cmp_hbm_readable(value))
++            return cmp_hbm_problem(hbm, -EIO, "HBM FB stop ACK unreadable",
++                                   CMP_HBM_FB_STOP_INPUT, value);
++        if (((value & CMP_HBM_FB_STOP) != 0U) == stopped)
++            return 0;
++        udelay(1);
++    }
++    return cmp_hbm_problem(hbm, -ETIMEDOUT,
++                           stopped ? "HBM FB stop ACK timeout" : "HBM FB resume ACK timeout",
++                           CMP_HBM_FB_STOP_INPUT, value);
++}
++
++static int cmp_hbm_fb_stop(struct cmp_hbm *hbm, void __iomem *bar)
++{
++    u32 request = readl(bar + CMP_HBM_FB_STOP_OUTPUT);
++    u32 ack     = readl(bar + CMP_HBM_FB_STOP_INPUT);
++
++    if (!cmp_hbm_readable(request) || !cmp_hbm_readable(ack))
++        return cmp_hbm_problem(hbm, -EIO, "HBM FB stop state unreadable",
++                               !cmp_hbm_readable(request) ? CMP_HBM_FB_STOP_OUTPUT : CMP_HBM_FB_STOP_INPUT,
++                               !cmp_hbm_readable(request) ? request : ack);
++    if (request & CMP_HBM_FB_STOP)
++    {
++        if (hbm->fb_stopped)
++            return cmp_hbm_fb_wait(hbm, bar, true);
++        return cmp_hbm_problem(hbm, -EBUSY, "HBM FB stop already owned",
++                               CMP_HBM_FB_STOP_OUTPUT, request);
++    }
++    if ((ack & CMP_HBM_FB_STOP) && !hbm->fb_stopped)
++        return cmp_hbm_problem(hbm, -EBUSY, "HBM FB stop ACK still set",
++                               CMP_HBM_FB_STOP_INPUT, ack);
++
++    hbm->fb_stopped = true;
++    writel(CMP_HBM_FB_STOP, bar + CMP_HBM_FB_STOP_SET);
++    request = readl(bar + CMP_HBM_FB_STOP_OUTPUT);
++    if (!cmp_hbm_readable(request) || !(request & CMP_HBM_FB_STOP))
++        return cmp_hbm_problem(hbm, -EIO, "HBM FB stop request did not latch",
++                               CMP_HBM_FB_STOP_OUTPUT, request);
++    return cmp_hbm_fb_wait(hbm, bar, true);
++}
++
++static int cmp_hbm_fb_start(struct cmp_hbm *hbm, void __iomem *bar)
++{
++    u32 request;
++    unsigned int i;
++    int ret;
++
++    for (i = 0; i < 24U; i++)
++    {
++        if (hbm->fbpas & (1U << i))
++            writel(1U, bar + cmp_hbm_fbpa(i) + CMP_HBM_SOFTWARE_REF);
++    }
++    writel(0U, bar + CMP_HBM_PRI_FENCE);
++    ndelay(20);
++    writel(CMP_HBM_FB_STOP, bar + CMP_HBM_FB_STOP_CLEAR);
++    request = readl(bar + CMP_HBM_FB_STOP_OUTPUT);
++    if (!cmp_hbm_readable(request) || (request & CMP_HBM_FB_STOP))
++        return cmp_hbm_problem(hbm, -EIO, "HBM FB resume request did not clear",
++                               CMP_HBM_FB_STOP_OUTPUT, request);
++    ret = cmp_hbm_fb_wait(hbm, bar, false);
++    if (!ret)
++        hbm->fb_stopped = false;
++    return ret;
++}
++
++struct cmp_hbm_switch {
++    struct cmp_hbm *hbm;
++    void __iomem *bar;
++    bool idle;
++};
++
++static int cmp_hbm_switch_profile(void *data)
++{
++    struct cmp_hbm_switch *work = (struct cmp_hbm_switch *)data;
++    struct cmp_hbm *hbm = work->hbm;
++    void __iomem *bar = work->bar;
++    bool idle = work->idle;
++    int ret = cmp_hbm_fb_stop(hbm, bar);
++    int resumed;
++
++    if (!ret)
++        ret = cmp_hbm_refresh(hbm, bar, idle, true);
++    if (!ret)
++        ret = cmp_hbm_set_clock(hbm, bar, idle);
++    if (!ret)
++        ret = cmp_hbm_refresh(hbm, bar, idle, false);
++    if (!hbm->fb_stopped)
++        return ret;
++    if (ret)
++    {
++        u32 coeff = readl(bar + hbm->first_fbpa + CMP_HBM_PLL_COEFF);
++        int ready;
++
++        if (coeff != hbm->busy_coeff && coeff != hbm->idle_coeff)
++            return cmp_hbm_problem(hbm, -EIO, "HBM FB resume blocked by unknown PLL",
++                                   hbm->first_fbpa + CMP_HBM_PLL_COEFF, coeff);
++        ready = cmp_hbm_pll_wait(hbm, bar, coeff, false,
++                                 "HBM FB resume blocked by PLL timeout");
++        if (ready)
++            return ready;
++    }
++    resumed = cmp_hbm_fb_start(hbm, bar);
++    return resumed ? resumed : ret;
++}
++
++/*
++ * Hold other CPUs during the ~2 ms FB-stop switch so concurrent host accesses
++ * cannot collide with the stopped framebuffer (Zagitta PR #373).
++ */
++static int cmp_hbm_transition(struct cmp_hbm *hbm, void __iomem *bar, bool idle)
++{
++    struct cmp_hbm_switch work = { .hbm = hbm, .bar = bar, .idle = idle };
++
++    return stop_machine(cmp_hbm_switch_profile, &work, NULL);
++}
++
++static int cmp_hbm_restore(struct cmp_hbm *hbm, void __iomem *bar)
++{
++    int ret;
++
++    if (!hbm->idle && !hbm->fb_stopped)
++        return 0;
++    if (!cmp_hbm_booted(bar))
++        return -EAGAIN;
++    ret = cmp_hbm_transition(hbm, bar, false);
++    if (!ret)
++        hbm->idle = false;
++    return ret;
++}
++
++static int cmp_hbm_enter_idle(struct cmp_hbm *hbm, void __iomem *bar)
++{
++    int ret;
++
++    if (((hbm->busy_coeff & CMP_HBM_NDIV_MASK) >> 8) * hbm->policy.pldiv <
++        hbm->policy.ndiv * ((hbm->busy_coeff & CMP_HBM_PLDIV_MASK) >> 16))
++        return cmp_hbm_problem(hbm, -EINVAL, "HBM idle target exceeds busy clock", 0U, 0U);
++
++    hbm->idle_coeff = cmp_hbm_idle_coeff(hbm);
++    hbm->idle = true;
++    ret = cmp_hbm_transition(hbm, bar, true);
++    if (ret)
++    {
++        (void)cmp_hbm_restore(hbm, bar);
++        hbm->baseline = false;
++    }
++    return ret;
++}
++
++static bool cmp_hbm_read_counter(struct cmp_hbm *hbm, void __iomem *bar,
++                                 unsigned int slot, struct cmp_hbm_counter *c)
++{
++    u32 before[5], after[5];
++    unsigned int i;
++
++    for (i = 0; i < 5U; i++)
++        before[i] = readl(bar + cmp_hbm_counter_addr[i] + slot * 4U);
++    c->count = readl(bar + 0x0010bf80U + slot * 4U);
++    c->delta = 0U;
++    for (i = 0; i < 5U; i++)
++        after[i] = readl(bar + cmp_hbm_counter_addr[i] + slot * 4U);
++    if (memcmp(before, after, sizeof(before)) != 0 || after[3] != 2U ||
++        (after[4] & ~CMP_HBM_COUNT_MASK) != 0U ||
++        (c->count & ~CMP_HBM_COUNT_MASK) != 0U)
++    {
++        cmp_hbm_problem(hbm, -EAGAIN, "activity counter unavailable",
++                        cmp_hbm_counter_addr[3] + slot * 4U, after[3]);
++        return false;
++    }
++    memcpy(c->mask, after, sizeof(c->mask));
++    c->control = after[3];
++    c->threshold = after[4];
++    return true;
++}
++
++static bool cmp_hbm_discover_counters(struct cmp_hbm *hbm, void __iomem *bar)
++{
++    u32 *covered = hbm->coverage;
++    unsigned int i, bank;
++
++    hbm->counters = 0U;
++    memset(covered, 0, sizeof(hbm->coverage));
++    for (i = 0; i < 16U; i++)
++    {
++        struct cmp_hbm_counter c;
++        bool useful = false;
++
++        if (!cmp_hbm_read_counter(hbm, bar, i, &c))
++            continue;
++        for (bank = 0; bank < 3U; bank++)
++        {
++            if (c.mask[bank] & cmp_hbm_required[bank] & ~covered[bank])
++                useful = true;
++        }
++        if (!useful)
++            continue;
++        hbm->counter[i] = c;
++        hbm->counters |= (u16)(1U << i);
++        for (bank = 0; bank < 3U; bank++)
++            covered[bank] |= c.mask[bank];
++    }
++    for (bank = 0; bank < 3U; bank++)
++    {
++        if ((covered[bank] & cmp_hbm_required[bank]) != cmp_hbm_required[bank])
++        {
++            cmp_hbm_problem(hbm, -EAGAIN, "activity counter coverage missing",
++                            cmp_hbm_counter_addr[bank], covered[bank]);
++            return false;
++        }
++    }
++    hbm->reason = NULL;
++    return true;
++}
++
++static int cmp_hbm_poll(struct cmp_hbm *hbm, void __iomem *bar, u64 now)
++{
++    bool busy = false;
++    unsigned int i;
++    int ret;
++
++    hbm->reason = NULL;
++    hbm->active_counters = 0U;
++    if (!cmp_hbm_booted(bar))
++    {
++        u32 boot = readl(bar + CMP_HBM_GFW_BOOT);
++
++        cmp_hbm_reset(hbm);
++        if (!cmp_hbm_readable(boot) || (boot & 0xffU) != 0xffU)
++            return cmp_hbm_problem(hbm, -EAGAIN, "waiting for GFW boot",
++                                   CMP_HBM_GFW_BOOT, boot);
++        return cmp_hbm_problem(hbm, -EAGAIN, "waiting for GFW/GSP boot",
++                               CMP_HBM_GSP_RISCV_STATUS,
++                               readl(bar + CMP_HBM_GSP_RISCV_STATUS));
++    }
++    if (!hbm->profile)
++    {
++        ret = cmp_hbm_capture_profile(hbm, bar);
++        if (ret)
++            return ret;
++    }
++    if (hbm->policy.mode == CMP_HBM_BUSY)
++        return cmp_hbm_restore(hbm, bar);
++    if (hbm->policy.mode == CMP_HBM_IDLE)
++    {
++        if (!hbm->baseline)
++        {
++            ret = cmp_hbm_restore(hbm, bar);
++            if (ret)
++                return ret;
++        }
++        ret = hbm->idle ? 0 : cmp_hbm_enter_idle(hbm, bar);
++        hbm->baseline = !ret;
++        return ret;
++    }
++    if (!hbm->baseline)
++    {
++        ret = cmp_hbm_restore(hbm, bar);
++        if (ret)
++            return ret;
++        if (!cmp_hbm_discover_counters(hbm, bar))
++            return -EAGAIN;
++        hbm->baseline = true;
++        hbm->sampled = hbm->quiet_since = now;
++        return 0;
++    }
++    if (now < hbm->sampled || (now - hbm->sampled) > CMP_HBM_MAX_SAMPLE_NS)
++    {
++        cmp_hbm_problem(hbm, -EAGAIN, "activity sample gap", 0U, 0U);
++        goto unknown;
++    }
++    for (i = 0; i < 16U; i++)
++    {
++        struct cmp_hbm_counter c;
++        struct cmp_hbm_counter *previous = &hbm->counter[i];
++
++        if (!(hbm->counters & (1U << i)))
++            continue;
++        if (!cmp_hbm_read_counter(hbm, bar, i, &c))
++            goto unknown;
++        if (memcmp(c.mask, previous->mask, sizeof(c.mask)) != 0 ||
++            c.control != previous->control || c.threshold != previous->threshold)
++        {
++            cmp_hbm_problem(hbm, -EAGAIN, "activity counter configuration changed",
++                            cmp_hbm_counter_addr[0] + i * 4U, c.mask[0]);
++            goto unknown;
++        }
++        c.delta = (c.count - previous->count) & CMP_HBM_COUNT_MASK;
++        if (c.delta != 0U)
++            hbm->active_counters |= (u16)(1U << i);
++        busy |= (c.delta != 0U);
++        *previous = c;
++    }
++    hbm->sampled = now;
++    if (busy)
++    {
++        hbm->quiet_since = now;
++        return cmp_hbm_restore(hbm, bar);
++    }
++    if (!hbm->idle && (now - hbm->quiet_since) >= ((u64)hbm->policy.idle_ms * 1000000ULL))
++        return cmp_hbm_enter_idle(hbm, bar);
++    return 0;
++
++unknown:
++    hbm->baseline = false;
++    ret = cmp_hbm_restore(hbm, bar);
++    return ret ? ret : -EAGAIN;
++}
++
++#ifdef __KERNEL__
++
++struct cmp_hbm_worker {
++    struct list_head node;
++    struct pci_dev *pdev;
++    void __iomem *bar;
++    struct mutex lock;
++    struct cmp_hbm hbm;
++    struct delayed_work work;
++    struct notifier_block pm_nb;
++    bool paused, stopping, pm_registered;
++    const char *last_reason;
++    int last_error;
++    u64 last_report;
++};
++
++static LIST_HEAD(cmp_hbm_workers);
++static DEFINE_MUTEX(cmp_hbm_list_lock);
++
++static int cmp_hbm_pm_active(struct pci_dev *pdev)
++{
++#ifdef CMP_PM_ACTIVE_HAS_IGNORE
++    return pm_runtime_get_if_active(&pdev->dev, true);
++#else
++    return pm_runtime_get_if_active(&pdev->dev);
++#endif
++}
++
++static void cmp_hbm_queue(struct cmp_hbm_worker *worker, unsigned long delay)
++{
++    if (!READ_ONCE(worker->paused) && !READ_ONCE(worker->stopping))
++        mod_delayed_work(system_freezable_wq, &worker->work, delay);
++}
++
++static int cmp_hbm_begin(struct cmp_hbm_worker *worker)
++{
++    struct pci_dev *pdev = worker->pdev;
++    u16 command = 0, lnksta = 0;
++    int pm;
++
++    if (pdev->current_state != PCI_D0)
++        return -ENODEV;
++    pm = cmp_hbm_pm_active(pdev);
++    if (!pm)
++        return -EAGAIN;
++    if (pci_read_config_word(pdev, PCI_COMMAND, &command) != 0 ||
++        command == 0xffffU || !(command & PCI_COMMAND_MEMORY))
++    {
++        if (pm > 0)
++            pm_runtime_put(&pdev->dev);
++        return -EAGAIN;
++    }
++    if (pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &lnksta) == 0 &&
++        (lnksta == 0xffffU || (lnksta & PCI_EXP_LNKSTA_LT) != 0U))
++    {
++        if (pm > 0)
++            pm_runtime_put(&pdev->dev);
++        return -EAGAIN;
++    }
++    return pm > 0;
++}
++
++static void cmp_hbm_end(struct cmp_hbm_worker *worker, int pm)
++{
++    if (pm > 0)
++        pm_runtime_put(&worker->pdev->dev);
++}
++
++static void cmp_hbm_sample(struct cmp_hbm_worker *worker)
++{
++    struct cmp_hbm *hbm = &worker->hbm;
++    bool was_profile = hbm->profile;
++    bool was_idle = hbm->idle;
++    u64 start = ktime_get_ns();
++    int ret;
++
++    ret = cmp_hbm_poll(hbm, worker->bar, start);
++    if (!was_profile && hbm->profile)
++    {
++        u32 coeff = hbm->busy_coeff;
++        u32 mdiv = coeff & 0xffU;
++        u32 ndiv = (coeff >> 8) & 0xffU;
++        u32 pldiv = (coeff >> 16) & 0x3fU;
++        u32 mhz = (mdiv && pldiv) ? (27U * ndiv / mdiv / pldiv) : 0U;
++
++        dev_info(&worker->pdev->dev,
++                 "CMP HBM: captured busy profile %u MHz coeff=0x%x idle_coeff=0x%x fbpas=0x%x first=0x%x\n",
++                 mhz, coeff, hbm->idle_coeff, hbm->fbpas, hbm->first_fbpa);
++    }
++    if (was_idle != hbm->idle)
++    {
++        u64 elapsed_us = (ktime_get_ns() - start) / 1000ULL;
++        dev_dbg(&worker->pdev->dev,
++                "CMP HBM: %s -> %s coeff=0x%x elapsed_us=%llu\n",
++                was_idle ? "idle" : "busy", hbm->idle ? "idle" : "busy",
++                readl(worker->bar + hbm->first_fbpa + CMP_HBM_PLL_COEFF),
++                (unsigned long long)elapsed_us);
++    }
++    if (ret)
++    {
++        if (ret != worker->last_error || hbm->reason != worker->last_reason ||
++            (ret != -EAGAIN && (start - worker->last_report) >= 5000000000ULL))
++        {
++            if (ret != -EAGAIN)
++            {
++                dev_warn(&worker->pdev->dev,
++                         "CMP HBM: %s (%d) reg=0x%x value=0x%x busy_coeff=0x%x idle_coeff=0x%x idle=%u fb_stopped=%u\n",
++                         hbm->reason ? hbm->reason : "hardware unavailable", ret,
++                         hbm->reg, hbm->value, hbm->busy_coeff, hbm->idle_coeff,
++                         hbm->idle ? 1U : 0U, hbm->fb_stopped ? 1U : 0U);
++            }
++            worker->last_report = start;
++        }
++    }
++    else if (worker->last_error || !worker->last_report)
++    {
++        worker->last_report = start;
++    }
++    worker->last_error = ret;
++    worker->last_reason = hbm->reason;
++}
++
++static void cmp_hbm_poll_work(struct work_struct *work)
++{
++    struct cmp_hbm_worker *worker = container_of(work, struct cmp_hbm_worker, work.work);
++    unsigned int delay = CMP_HBM_POLL_MS;
++    int pm;
++
++    if (READ_ONCE(worker->paused) || READ_ONCE(worker->stopping))
++        return;
++
++    if (mutex_trylock(&worker->lock))
++    {
++        if (!READ_ONCE(worker->paused) && !READ_ONCE(worker->stopping))
++        {
++            pm = cmp_hbm_begin(worker);
++            if (pm >= 0)
++            {
++                cmp_hbm_sample(worker);
++                if (worker->last_error && worker->last_error != -EAGAIN)
++                    delay = CMP_HBM_RETRY_MS;
++                cmp_hbm_end(worker, pm);
++            }
++            else
++            {
++                cmp_hbm_reset(&worker->hbm);
++            }
++        }
++        mutex_unlock(&worker->lock);
++    }
++    cmp_hbm_queue(worker, msecs_to_jiffies(delay));
++}
++
++static void cmp_hbm_restore_locked(struct cmp_hbm_worker *worker)
++{
++    int pm = cmp_hbm_begin(worker);
++
++    if (pm >= 0)
++    {
++        bool was_idle = worker->hbm.idle;
++        int ret = cmp_hbm_restore(&worker->hbm, worker->bar);
++
++        if (ret)
++        {
++            dev_warn(&worker->pdev->dev,
++                     "CMP HBM: busy restore deferred (%d) %s reg=0x%x value=0x%x\n",
++                     ret, worker->hbm.reason ? worker->hbm.reason : "hardware unavailable",
++                     worker->hbm.reg, worker->hbm.value);
++        }
++        else if (was_idle)
++        {
++            dev_info(&worker->pdev->dev,
++                     "CMP HBM: busy profile restored for detach/sleep\n");
++        }
++        cmp_hbm_end(worker, pm);
++    }
++    else if (worker->hbm.idle)
++    {
++        dev_warn(&worker->pdev->dev,
++                 "CMP HBM: busy restore deferred: PCI device inactive (%d)\n", pm);
++    }
++    cmp_hbm_reset(&worker->hbm);
++}
++
++static int cmp_hbm_pm_notify(struct notifier_block *nb, unsigned long event, void *unused)
++{
++    struct cmp_hbm_worker *worker = container_of(nb, struct cmp_hbm_worker, pm_nb);
++
++    (void)unused;
++    switch (event)
++    {
++    case PM_SUSPEND_PREPARE:
++    case PM_HIBERNATION_PREPARE:
++    case PM_RESTORE_PREPARE:
++        WRITE_ONCE(worker->paused, true);
++        cancel_delayed_work_sync(&worker->work);
++        mutex_lock(&worker->lock);
++        cmp_hbm_restore_locked(worker);
++        mutex_unlock(&worker->lock);
++        break;
++    case PM_POST_SUSPEND:
++    case PM_POST_HIBERNATION:
++    case PM_POST_RESTORE:
++        mutex_lock(&worker->lock);
++        cmp_hbm_reset(&worker->hbm);
++        mutex_unlock(&worker->lock);
++        WRITE_ONCE(worker->paused, false);
++        cmp_hbm_queue(worker, 0);
++        break;
++    default:
++        break;
++    }
++    return NOTIFY_DONE;
++}
++
++static void cmp_hbm_worker_start(struct pci_dev *pdev)
++{
++    struct cmp_hbm_worker *worker;
++    unsigned int domain, bus, slot, fn;
++    u32 idle_ms;
++    int ret;
++
++    if (pdev == NULL || (pdev->device != 0x20C2 && pdev->device != 0x2082))
++        return;
++
++    domain = (unsigned int)pci_domain_nr(pdev->bus);
++    bus    = (unsigned int)pdev->bus->number;
++    slot   = (unsigned int)PCI_SLOT(pdev->devfn);
++    fn     = (unsigned int)PCI_FUNC(pdev->devfn);
++
++    if (!cmp170hx_want_hbm_governor(domain, bus, slot, fn))
++        return;
++
++    if (pci_resource_len(pdev, 0) < 0x00a00000ULL)
++    {
++        dev_warn(&pdev->dev, "CMP HBM: BAR0 too small for HBM governor\n");
++        return;
++    }
++
++    worker = kzalloc(sizeof(*worker), GFP_KERNEL);
++    if (!worker)
++        return;
++
++    idle_ms = cmp170hx_get_hbm_idle_ms();
++    cmp_hbm_init(&worker->hbm, idle_ms);
++    worker->pdev = pdev;
++    mutex_init(&worker->lock);
++    INIT_DELAYED_WORK(&worker->work, cmp_hbm_poll_work);
++    worker->pm_nb.notifier_call = cmp_hbm_pm_notify;
++    /* Quiesce at the start of Linux's sleep notification chain before GPU suspend. */
++    worker->pm_nb.priority = INT_MAX;
++
++    worker->bar = pci_iomap_range(pdev, 0, 0, 0x00a00000UL);
++    if (!worker->bar)
++    {
++        dev_warn(&pdev->dev, "CMP HBM: failed to map BAR0 for HBM governor\n");
++        kfree(worker);
++        return;
++    }
++
++    ret = register_pm_notifier(&worker->pm_nb);
++    if (ret)
++    {
++        dev_warn(&pdev->dev, "CMP HBM: failed to register PM notifier (%d)\n", ret);
++        pci_iounmap(pdev, worker->bar);
++        kfree(worker);
++        return;
++    }
++    worker->pm_registered = true;
++
++    mutex_lock(&cmp_hbm_list_lock);
++    list_add_tail(&worker->node, &cmp_hbm_workers);
++    mutex_unlock(&cmp_hbm_list_lock);
++
++    dev_info(&pdev->dev,
++             "CMP HBM: governor registered idle_ms=%u poll_ms=%u idle_ndiv=%u idle_pldiv=%u idle_refresh=%u transition=stop_machine/fb-stop/bypass\n",
++             worker->hbm.policy.idle_ms, CMP_HBM_POLL_MS,
++             CMP_HBM_IDLE_NDIV, CMP_HBM_IDLE_PLDIV, CMP_HBM_IDLE_REFRESH);
++    cmp_hbm_queue(worker, 0);
++}
++
++static void cmp_hbm_worker_stop(struct pci_dev *pdev)
++{
++    struct cmp_hbm_worker *worker = NULL, *cur;
++
++    if (pdev == NULL)
++        return;
++
++    mutex_lock(&cmp_hbm_list_lock);
++    list_for_each_entry(cur, &cmp_hbm_workers, node)
++    {
++        if (cur->pdev == pdev)
++        {
++            list_del(&cur->node);
++            worker = cur;
++            break;
++        }
++    }
++    mutex_unlock(&cmp_hbm_list_lock);
++
++    if (!worker)
++        return;
++
++    WRITE_ONCE(worker->stopping, true);
++    if (worker->pm_registered)
++        unregister_pm_notifier(&worker->pm_nb);
++    cancel_delayed_work_sync(&worker->work);
++    mutex_lock(&worker->lock);
++    cmp_hbm_restore_locked(worker);
++    mutex_unlock(&worker->lock);
++    pci_iounmap(pdev, worker->bar);
++    kfree(worker);
++}
++
++#endif /* __KERNEL__ */
++
++#endif /* NV_CMP_HBM_H */
+diff --git a/kernel-open/nvidia/nv-pci.c b/kernel-open/nvidia/nv-pci.c
+index 9bb5958..26c3b25 100644
+--- a/kernel-open/nvidia/nv-pci.c
++++ b/kernel-open/nvidia/nv-pci.c
+@@ -65,11 +65,16 @@ int cmp_max_pcie_gen = -1;
+ int cmp_pcie_retrain = 1;
+ int cmp_bar1_gb = 0;
+ int cmp_magicd_a100 = 0;
++int cmp_p8_low_power = -1;
++int cmp_p8_vbios = -1;
++int cmp_hbm_governor = -1;
++int cmp_p8_min_mhz = 135;
++int cmp_hbm_idle_ms = 5000;
+ char *cmp_bdf = "";
+ 
+ module_param(cmp_auto, int, 0444);
+ MODULE_PARM_DESC(cmp_auto,
+-    "CMP 170HX: auto-enable VRAM/SM/PCIe unlocks allowed by each card's fuses and floorplan (0=conservative default, 1=auto)");
++    "CMP 170HX: auto-enable VRAM/SM/PCIe/P8 unlocks allowed by each card's fuses and floorplan (0=conservative default, 1=auto)");
+ module_param(cmp_unlock_vram, int, 0444);
+ MODULE_PARM_DESC(cmp_unlock_vram,
+     "CMP 170HX: extended VRAM above 64G/40G from active FBPs (-1=follow cmp_auto, 0=cap 64G/40G, 1=enable 80G/96G/48G)");
+@@ -88,6 +93,21 @@ MODULE_PARM_DESC(cmp_bar1_gb,
+ module_param(cmp_magicd_a100, int, 0444);
+ MODULE_PARM_DESC(cmp_magicd_a100,
+     "CMP 170HX: also clear extra A100 parity bits 0x14480000 in PCIE_MAGIC_BITS_D on Gen4 SW override (0=bit25 only default, 1=A100 parity)");
++module_param(cmp_p8_low_power, int, 0444);
++MODULE_PARM_DESC(cmp_p8_low_power,
++    "CMP 170HX: Zagitta P8 low-power mode (P8 VBIOS idle core clocks + HBM idle clock governor; -1=follow cmp_auto, 0=off, 1=on)");
++module_param(cmp_p8_vbios, int, 0444);
++MODULE_PARM_DESC(cmp_p8_vbios,
++    "CMP 170HX: boot-generated P8 VBIOS override (-1=follow cmp_p8_low_power, 0=off, 1=on)");
++module_param(cmp_hbm_governor, int, 0444);
++MODULE_PARM_DESC(cmp_hbm_governor,
++    "CMP 170HX: activity-based HBM idle clock governor (-1=follow cmp_p8_low_power, 0=off, 1=on)");
++module_param(cmp_p8_min_mhz, int, 0444);
++MODULE_PARM_DESC(cmp_p8_min_mhz,
++    "CMP 170HX: P8 VBIOS idle clock floor in MHz for GPC/XBAR/SYS/NVD/HOST (default: 135)");
++module_param(cmp_hbm_idle_ms, int, 0444);
++MODULE_PARM_DESC(cmp_hbm_idle_ms,
++    "CMP 170HX: quiet time in ms before HBM governor drops to 540 MHz idle profile (default: 5000, min: 100)");
+ module_param(cmp_bdf, charp, 0444);
+ MODULE_PARM_DESC(cmp_bdf,
+     "CMP 170HX: comma-separated PCI BDF filter for advanced unlocks, e.g. 0000:01:00.0 (empty=all CMP 170HX GPUs)");
+@@ -103,6 +123,12 @@ int cmp170hx_want_max_pcie_gen(unsigned int domain, unsigned int bus,
+ int cmp170hx_want_pcie_retrain(void);
+ int cmp170hx_want_bar1_gb(void);
+ int cmp170hx_want_magicd_a100(void);
++int cmp170hx_want_p8_vbios(unsigned int domain, unsigned int bus,
++                           unsigned int dev, unsigned int fn);
++int cmp170hx_want_hbm_governor(unsigned int domain, unsigned int bus,
++                               unsigned int dev, unsigned int fn);
++int cmp170hx_get_p8_min_mhz(void);
++unsigned int cmp170hx_get_hbm_idle_ms(void);
+ 
+ int cmp170hx_bdf_matches(unsigned int domain, unsigned int bus,
+                          unsigned int dev, unsigned int fn)
+@@ -196,6 +222,49 @@ int cmp170hx_want_magicd_a100(void)
+     return (cmp_magicd_a100 != 0) ? 1 : 0;
+ }
+ 
++static int cmp170hx_want_p8_low_power(void)
++{
++    if (cmp_p8_low_power >= 0)
++        return (cmp_p8_low_power != 0) ? 1 : 0;
++    return (cmp_auto != 0) ? 1 : 0;
++}
++
++int cmp170hx_want_p8_vbios(unsigned int domain, unsigned int bus,
++                           unsigned int dev, unsigned int fn)
++{
++    if (!cmp170hx_bdf_matches(domain, bus, dev, fn))
++        return 0;
++    if (cmp_p8_vbios >= 0)
++        return (cmp_p8_vbios != 0) ? 1 : 0;
++    return cmp170hx_want_p8_low_power();
++}
++
++int cmp170hx_want_hbm_governor(unsigned int domain, unsigned int bus,
++                               unsigned int dev, unsigned int fn)
++{
++    if (!cmp170hx_bdf_matches(domain, bus, dev, fn))
++        return 0;
++    if (cmp_hbm_governor >= 0)
++        return (cmp_hbm_governor != 0) ? 1 : 0;
++    return cmp170hx_want_p8_low_power();
++}
++
++int cmp170hx_get_p8_min_mhz(void)
++{
++    if (cmp_p8_min_mhz <= 0 || cmp_p8_min_mhz > 0x3fff)
++        return 135;
++    return cmp_p8_min_mhz;
++}
++
++unsigned int cmp170hx_get_hbm_idle_ms(void)
++{
++    if (cmp_hbm_idle_ms < 100)
++        return 5000U;
++    return (unsigned int)cmp_hbm_idle_ms;
++}
++
++#include "nv-cmp-hbm.h"
++
+ #define CMP_FUSE_MAP_SIZE              0x00830000U
+ #define CMP_PMC_BOOT_0                 0x00000000U
+ #define CMP_FUSE_FUSECTRL              0x00820000U
+@@ -3447,6 +3516,8 @@ nv_pci_probe_body
+ 
+     nvidia_modeset_probe(nvl);
+ 
++    cmp_hbm_worker_start(pci_dev);
++
+     /*
+      * Dynamic power management should be enabled as the last step.
+      * Kernel runtime power management framework can put the device
+@@ -3603,6 +3674,8 @@ static void nv_pci_remove_helper(struct pci_dev *pci_dev, bool block_if_gpu_in_u
+         return;
+     }
+ 
++    cmp_hbm_worker_stop(pci_dev);
++
+     nv = NV_STATE_PTR(nvl);
+ 
+ #if NV_IS_EXPORT_SYMBOL_GPL_iommu_dev_disable_feature
+diff --git a/kernel-open/nvidia/nvidia.Kbuild b/kernel-open/nvidia/nvidia.Kbuild
+index bfef671..4669655 100644
+--- a/kernel-open/nvidia/nvidia.Kbuild
++++ b/kernel-open/nvidia/nvidia.Kbuild
+@@ -55,6 +55,7 @@ nvidia-y += $(NVIDIA_BINARY_OBJECT_O)
+ NVIDIA_CFLAGS += -I$(src)/nvidia
+ NVIDIA_CFLAGS += -DNVIDIA_UNDEF_LEGACY_BIT_MACROS
+ NVIDIA_CFLAGS += -DLIBSPDM_CONFIG=\"nvspdm_rmconfig.h\"
++NVIDIA_CFLAGS += $(if $(shell grep -A 1 'pm_runtime_get_if_active' $(or $(NV_KERNEL_SOURCES),$(srctree))/include/linux/pm_runtime.h 2>/dev/null | grep 'bool'),-DCMP_PM_ACTIVE_HAS_IGNORE)
+ 
+ ifeq ($(NV_BUILD_TYPE),release)
+  NVIDIA_CFLAGS += -UDEBUG -U_DEBUG -DNDEBUG
+diff --git a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+index 892303a..1012c7c 100644
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -132,6 +132,71 @@ NV_STATUS kgspSec2PostblTimingRebuildStockSignature(OBJGPU *pGpu, KernelGsp *pKe
+ 
+ extern int cmp170hx_want_unlock_vram(unsigned int domain, unsigned int bus,
+                                      unsigned int dev, unsigned int fn);
++extern int cmp170hx_want_p8_vbios(unsigned int domain, unsigned int bus,
++                                  unsigned int dev, unsigned int fn);
++extern int cmp170hx_want_hbm_governor(unsigned int domain, unsigned int bus,
++                                      unsigned int dev, unsigned int fn);
++extern int cmp170hx_get_p8_min_mhz(void);
++
++#include "nv_cmp_p8_vbios.h"
++
++static void
++_kgspCmp170hxApplyP8Overrides(OBJGPU *pGpu, const KernelGspVbiosImg *pVbiosImg)
++{
++    NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
++    NvU8 existing[266];
++    NvU32 existingLen = (NvU32)sizeof(existing);
++    NvU8 p8Rec[CMP_P8_RECORD_SIZE];
++    NvU8 csumRec[CMP_P8_CHECKSUM_SIZE];
++    NvU16 minMhz;
++    int rc;
++
++    if ((devId != SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID &&
++         devId != SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID) ||
++        pVbiosImg == NULL || pVbiosImg->pImage == NULL || pVbiosImg->biosSize == 0U)
++        return;
++
++    if (!cmp170hx_want_p8_vbios(gpuGetDomain(pGpu), gpuGetBus(pGpu), gpuGetDevice(pGpu), 0U))
++        return;
++
++    /* Respect any user-supplied or previously installed romOverride00 entry. */
++    if (osReadRegistryBinary(pGpu, "romOverride00", existing, &existingLen) == NV_OK)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "SEC2_DEBUG: CMP P8: existing romOverride00 present; preserving it\n");
++        return;
++    }
++
++    minMhz = (NvU16)cmp170hx_get_p8_min_mhz();
++    rc = cmp_p8_build_overrides(pVbiosImg->pImage, pVbiosImg->biosSize,
++                                minMhz, p8Rec, csumRec);
++    if (rc == CMP_P8_ERR_ALREADY)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "SEC2_DEBUG: CMP P8: board VBIOS already provides P8\n");
++        return;
++    }
++    if (rc != CMP_P8_OK)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "SEC2_DEBUG: CMP P8: P8 override unavailable for this VBIOS (rc=%d)\n", rc);
++        return;
++    }
++
++    if (osWriteRegistryBinary(pGpu, "romOverride00", p8Rec, (NvU32)sizeof(p8Rec)) != NV_OK ||
++        osWriteRegistryBinary(pGpu, "romOverride01", csumRec, (NvU32)sizeof(csumRec)) != NV_OK)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "SEC2_DEBUG: CMP P8: failed to register romOverride00/01\n");
++        return;
++    }
++
++    NV_PRINTF(LEVEL_ERROR,
++              "SEC2_DEBUG: CMP P8: generated VBIOS override BIOS=%02x.%02x.%02x.%02x.%02x "
++              "p8_off=0x%x csum_off=0x%x min_mhz=%u (factory P0 preserved)\n",
++              p8Rec[0], p8Rec[1], p8Rec[2], p8Rec[3], p8Rec[4],
++              cmp_p8_r32(p8Rec + 5), cmp_p8_r32(csumRec + 5), (unsigned int)minMhz);
++}
+ 
+ static NvU32
+ _kgspCmp170hxPopcount(NvU32 v)
+@@ -6014,6 +6079,39 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
+             GPU_REG_WR32(pGpu, 0x001fa82cU, 0xffffffffU); GPU_REG_WR32(pGpu, 0x001fa830U, 0x00000000U);
+             GPU_REG_WR32(pGpu, 0x001fa80cU, GPU_REG_RD32(pGpu, 0x001fa80cU) & ~0x10U);
+         }
++        if (cmp170hx_want_hbm_governor(gpuGetDomain(pGpu), gpuGetBus(pGpu), gpuGetDevice(pGpu), 0U))
++        {
++            static const struct { NvU32 addr; NvU32 val; const char *name; } hbmPlms[] = {
++                { 0x009a0168U, 0xffffffffU, "FBPA_CONFIG_PLM" },
++                { 0x009a3c7cU, 0xffffffffU, "FBPA_HBMPLL_PLM" },
++            };
++            NvU32 hi, ha;
++            for (hi = 0; hi < NV_ARRAY_ELEMENTS(hbmPlms); hi++)
++            {
++                NvBool opened = NV_FALSE;
++                for (ha = 0; ha < 2U && !opened; ha++)
++                {
++                    NvU32 rb;
++                    GPU_REG_WR32(pGpu, 0x001fa824U, 0xffffffffU);
++                    GPU_REG_WR32(pGpu, 0x001fa828U, 0x00000000U);
++                    if (kgspSec2PostblTimingRefillPayload(pGpu, pKernelGsp, hbmPlms[hi].addr, hbmPlms[hi].val) != NV_OK)
++                        continue;
++                    (void)kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
++                        memdescGetPhysAddr(SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp), AT_GPU, 0));
++                    rb = GPU_REG_RD32(pGpu, hbmPlms[hi].addr);
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG: CMP HBM PLM[%u] %s(0x%x) attempt=%u reg=0x%08x\n",
++                              hi, hbmPlms[hi].name, hbmPlms[hi].addr, ha, rb);
++                    if ((rb & 0x10U) != 0U && (rb & 0xfff00000U) != 0xbad00000U)
++                        opened = NV_TRUE;
++                }
++            }
++            GPU_REG_WR32(pGpu, 0x001fa81cU, 0xffffffffU); GPU_REG_WR32(pGpu, 0x001fa820U, 0x00000000U);
++            GPU_REG_WR32(pGpu, 0x001fa824U, 0xffffffffU); GPU_REG_WR32(pGpu, 0x001fa828U, 0x00000000U);
++            GPU_REG_WR32(pGpu, 0x001fa804U, 0xffffffffU); GPU_REG_WR32(pGpu, 0x001fa808U, 0x00000000U);
++            GPU_REG_WR32(pGpu, 0x001fa82cU, 0xffffffffU); GPU_REG_WR32(pGpu, 0x001fa830U, 0x00000000U);
++            GPU_REG_WR32(pGpu, 0x001fa80cU, GPU_REG_RD32(pGpu, 0x001fa80cU) & ~0x10U);
++        }
+         plmStatus = kgspSec2PostblTimingRebuildStockSignature(pGpu, pKernelGsp);
+         if (plmStatus != NV_OK)
+         {
+@@ -6143,6 +6241,10 @@ kgspInitRm_IMPL
+             // Got a VBIOS image, now parse it for FWSEC.
+             status = kgspParseFwsecUcodeFromVbiosImg(pGpu, pKernelGsp, pVbiosImg,
+                                                      &pKernelGsp->pFwsecUcode, &vbiosVersionCombined);
++            if (status == NV_OK)
++            {
++                _kgspCmp170hxApplyP8Overrides(pGpu, pVbiosImg);
++            }
+             kgspFreeVbiosImg(pVbiosImg);
+ 
+             if (vbiosVersionCombined > 0)
+diff --git a/src/nvidia/src/kernel/gpu/gsp/nv_cmp_p8_vbios.h b/src/nvidia/src/kernel/gpu/gsp/nv_cmp_p8_vbios.h
+new file mode 100644
+index 0000000..e6f64f6
+--- /dev/null
++++ b/src/nvidia/src/kernel/gpu/gsp/nv_cmp_p8_vbios.h
+@@ -0,0 +1,434 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-only
++ *
++ * GA100 / CMP 170HX P8 VBIOS override generator.
++ *
++ * Ported from Zagitta/gpu-unlock (kernel/gpu_unlock/vbios.c):
++ * Synthesizes a P8 (pstate 7) row in empty slot 0 of the GA100 Performance
++ * 0x60 table by cloning factory P0 (pstate 15), lowering only the minimum
++ * clock floors of GPC, XBAR, SYS, NVD, and HOST to minimum_mhz (default 135
++ * MHz), preserving voltage policy, HBM tuple, and factory P0, and emitting
++ * NVIDIA romOverride binary records (75-byte row + 11-byte ROM checksum).
++ */
++#ifndef NV_CMP_P8_VBIOS_H
++#define NV_CMP_P8_VBIOS_H
++
++#ifdef CMP_P8_HOST_TEST
++#include <stddef.h>
++#include <stdint.h>
++typedef uint8_t  cmp_u8;
++typedef uint16_t cmp_u16;
++typedef uint32_t cmp_u32;
++typedef uint64_t cmp_u64;
++#else
++typedef NvU8  cmp_u8;
++typedef NvU16 cmp_u16;
++typedef NvU32 cmp_u32;
++typedef NvU64 cmp_u64;
++#endif
++
++#define CMP_P8_OK          0
++#define CMP_P8_ERR_ALREADY 1
++#define CMP_P8_ERR_INVAL   (-1)
++#define CMP_P8_ERR_UNSUP   (-2)
++#define CMP_P8_ERR_BADMSG  (-3)
++#define CMP_P8_ERR_NOENT   (-4)
++
++#define CMP_P8_RECORD_SIZE   75U
++#define CMP_P8_CHECKSUM_SIZE 11U
++#define CMP_P8_DEFAULT_MIN_MHZ 135U
++
++static cmp_u16 cmp_p8_r16(const cmp_u8 *p)
++{
++    return (cmp_u16)((cmp_u16)p[0] | ((cmp_u16)p[1] << 8));
++}
++
++static cmp_u32 cmp_p8_r32(const cmp_u8 *p)
++{
++    return (cmp_u32)p[0] | ((cmp_u32)p[1] << 8) |
++           ((cmp_u32)p[2] << 16) | ((cmp_u32)p[3] << 24);
++}
++
++static void cmp_p8_w32(cmp_u8 *p, cmp_u32 value)
++{
++    p[0] = (cmp_u8)(value & 0xffU);
++    p[1] = (cmp_u8)((value >> 8) & 0xffU);
++    p[2] = (cmp_u8)((value >> 16) & 0xffU);
++    p[3] = (cmp_u8)((value >> 24) & 0xffU);
++}
++
++static void cmp_p8_memcpy(cmp_u8 *dst, const cmp_u8 *src, cmp_u32 len)
++{
++    cmp_u32 i;
++    for (i = 0; i < len; i++)
++        dst[i] = src[i];
++}
++
++static int cmp_p8_memeq(const cmp_u8 *a, const cmp_u8 *b, cmp_u32 len)
++{
++    cmp_u32 i;
++    for (i = 0; i < len; i++)
++    {
++        if (a[i] != b[i])
++            return 0;
++    }
++    return 1;
++}
++
++static int cmp_p8_range(cmp_u64 length, cmp_u64 off, cmp_u64 bytes)
++{
++    return (off > length || bytes > length - off) ? CMP_P8_ERR_INVAL : CMP_P8_OK;
++}
++
++static int cmp_p8_rom_signature(cmp_u16 sig)
++{
++    return sig == 0xaa55U || sig == 0x4e56U || sig == 0xbb77U;
++}
++
++static int cmp_p8_data_signature(cmp_u32 sig)
++{
++    return sig == 0x52494350U || sig == 0x5344504eU || sig == 0x53494752U;
++}
++
++static int cmp_p8_pci_image(const cmp_u8 *rom, cmp_u64 length, cmp_u32 *offset)
++{
++    cmp_u32 image = 0;
++
++    if (length >= 12U && cmp_p8_r32(rom) == 0x4947564eU)
++    {
++        cmp_u32 version = (cmp_p8_r32(rom + 4) >> 8) & 0xffU;
++        cmp_u32 total, flash;
++        cmp_u64 dir;
++
++        if (version != 3U)
++            return CMP_P8_ERR_UNSUP;
++        total = cmp_p8_r32(rom + 8) & 0xfffffU;
++        if (cmp_p8_range(length, total, 4U) != CMP_P8_OK)
++            return CMP_P8_ERR_INVAL;
++        flash = cmp_p8_r32(rom + total);
++        dir = (cmp_u64)flash + 0x1000U;
++        if (cmp_p8_range(length, dir, 12U) != CMP_P8_OK ||
++            cmp_p8_r32(rom + dir) != 0x44524652U)
++            return CMP_P8_ERR_INVAL;
++        image = cmp_p8_r32(rom + dir + 8);
++        if (image == 0U || (image & 3U) != 0U ||
++            cmp_p8_range(length, image, 2U) != CMP_P8_OK ||
++            cmp_p8_r16(rom + image) != 0xaa55U)
++            return CMP_P8_ERR_INVAL;
++    }
++    *offset = image;
++    return CMP_P8_OK;
++}
++
++static int cmp_p8_expansion(const cmp_u8 *rom, cmp_u64 length, cmp_u32 *adjust)
++{
++    cmp_u32 pos = 0, base = 0, ext = 0;
++    unsigned int images = 0;
++
++    if (cmp_p8_range(length, 0, 2U) != CMP_P8_OK || !cmp_p8_rom_signature(cmp_p8_r16(rom)))
++        return CMP_P8_ERR_INVAL;
++
++    for (;;)
++    {
++        cmp_u64 pcir, npde;
++        cmp_u32 bytes, last, sig;
++        cmp_u16 ext_rev, ext_len;
++
++        if (++images > 8U || cmp_p8_range(length, pos, 0x1aU) != CMP_P8_OK ||
++            !cmp_p8_rom_signature(cmp_p8_r16(rom + pos)))
++            return CMP_P8_ERR_INVAL;
++
++        pcir = (cmp_u64)pos + cmp_p8_r16(rom + pos + 0x18);
++        if (cmp_p8_range(length, pcir, 0x16U) != CMP_P8_OK)
++            return CMP_P8_ERR_INVAL;
++
++        sig = cmp_p8_r32(rom + pcir);
++        if (!cmp_p8_data_signature(sig))
++            return CMP_P8_ERR_INVAL;
++
++        bytes = (cmp_u32)cmp_p8_r16(rom + pcir + 0x10) * 512U;
++        last = rom[pcir + 0x15] & 0x80U;
++        npde = (pcir + cmp_p8_r16(rom + pcir + 0x0a) + 15U) & ~(cmp_u64)15U;
++        if (cmp_p8_range(length, npde, 4U) == CMP_P8_OK &&
++            cmp_p8_r32(rom + npde) == 0x4544504eU)
++        {
++            if (cmp_p8_range(length, npde, 10U) != CMP_P8_OK)
++                return CMP_P8_ERR_INVAL;
++            ext_rev = cmp_p8_r16(rom + npde + 4);
++            ext_len = cmp_p8_r16(rom + npde + 6);
++            if (ext_rev == 0x100U || ext_rev == 0x101U)
++            {
++                cmp_u32 sub = (cmp_u32)cmp_p8_r16(rom + npde + 8) * 512U;
++                if (ext_len < 10U || cmp_p8_range(length, npde, ext_len) != CMP_P8_OK)
++                    return CMP_P8_ERR_INVAL;
++                if (ext_len > 10U)
++                    last = rom[npde + 10] & 0x80U;
++                else if (sub < bytes)
++                    last = 0U;
++                bytes = sub;
++            }
++        }
++        if (bytes == 0U || cmp_p8_range(length, pos, bytes) != CMP_P8_OK)
++            return CMP_P8_ERR_INVAL;
++        if (base == 0U && rom[pcir + 0x14] == 0U)
++            base = bytes;
++        if (ext == 0U && rom[pcir + 0x14] == 0xe0U)
++            ext = pos;
++        if (last != 0U)
++            break;
++        pos += bytes;
++    }
++
++    if (ext != 0U && base != 0U && ext < base)
++        return CMP_P8_ERR_INVAL;
++    *adjust = (ext != 0U && base != 0U) ? (ext - base) : 0U;
++    return CMP_P8_OK;
++}
++
++typedef struct cmp_p8_image {
++    const cmp_u8 *rom;
++    cmp_u64 length;
++    cmp_u32 adjust;
++    cmp_u32 token;
++    cmp_u8 version[5];
++} cmp_p8_image_t;
++
++static int cmp_p8_find_image(const cmp_u8 *rom, cmp_u64 length, cmp_u8 kind,
++                             cmp_u32 minimum, cmp_p8_image_t *out)
++{
++    cmp_u32 image = 0, adjust = 0, pcir, bit, legacy, bios = 0, data = 0;
++    int found = 0;
++    int ret;
++
++    if (rom == NULL || length > (1024U * 1024U))
++        return CMP_P8_ERR_INVAL;
++
++    ret = cmp_p8_pci_image(rom, length, &image);
++    if (ret != CMP_P8_OK)
++        return ret;
++    rom += image;
++    length -= image;
++
++    ret = cmp_p8_expansion(rom, length, &adjust);
++    if (ret != CMP_P8_OK)
++        return ret;
++    if (cmp_p8_range(length, 0, 0x1aU) != CMP_P8_OK)
++        return CMP_P8_ERR_INVAL;
++
++    pcir = cmp_p8_r16(rom + 0x18);
++    if (cmp_p8_range(length, pcir, 0x16U) != CMP_P8_OK ||
++        cmp_p8_r16(rom) != 0xaa55U ||
++        cmp_p8_r32(rom + pcir) != 0x52494350U ||
++        cmp_p8_r16(rom + pcir + 4) != 0x10deU ||
++        rom[pcir + 0x14] != 0U)
++        return CMP_P8_ERR_UNSUP;
++
++    if (cmp_p8_r16(rom + pcir + 0x10) == 0U ||
++        cmp_p8_range(length, 0, (cmp_u64)cmp_p8_r16(rom + pcir + 0x10) * 512U) != CMP_P8_OK)
++        return CMP_P8_ERR_INVAL;
++
++    legacy = (cmp_u32)cmp_p8_r16(rom + pcir + 0x10) * 512U;
++    for (bit = 0; bit + 12U <= legacy; bit++)
++    {
++        cmp_u32 header, stride, count, sum = 0, i, b = 0, in = 0;
++
++        if (cmp_p8_r16(rom + bit) != 0xb8ffU || cmp_p8_r32(rom + bit + 2) != 0x00544942U)
++            continue;
++        header = rom[bit + 8];
++        stride = rom[bit + 9];
++        count  = rom[bit + 10];
++        if (cmp_p8_r16(rom + bit + 6) != 0x100U || header < 12U ||
++            (stride != 6U && stride != 8U) ||
++            cmp_p8_range(legacy, bit, header) != CMP_P8_OK ||
++            cmp_p8_range(legacy, (cmp_u64)bit + header, (cmp_u64)count * stride) != CMP_P8_OK)
++            return CMP_P8_ERR_BADMSG;
++        for (i = 0; i < header; i++)
++            sum += rom[bit + i];
++        if ((sum & 0xffU) != 0U)
++            return CMP_P8_ERR_BADMSG;
++        for (i = 0; i < count; i++)
++        {
++            const cmp_u8 *token = rom + bit + header + i * stride;
++            cmp_u32 ptr = (stride == 8U) ? cmp_p8_r32(token + 4) : cmp_p8_r16(token + 4);
++
++            if (token[0] != (cmp_u8)'B' && token[0] != kind)
++                continue;
++            if (token[1] != 2U || cmp_p8_range(legacy, ptr, cmp_p8_r16(token + 2)) != CMP_P8_OK || ptr == 0U)
++                return CMP_P8_ERR_UNSUP;
++            if (token[0] == (cmp_u8)'B')
++            {
++                if (b != 0U || cmp_p8_r16(token + 2) < 5U)
++                    return CMP_P8_ERR_BADMSG;
++                b = ptr;
++            }
++            else
++            {
++                if (in != 0U || cmp_p8_r16(token + 2) < minimum)
++                    return CMP_P8_ERR_BADMSG;
++                in = ptr;
++            }
++        }
++        if (b == 0U || in == 0U || found != 0)
++            return CMP_P8_ERR_BADMSG;
++        bios = b;
++        data = in;
++        found = 1;
++    }
++    if (!found)
++        return CMP_P8_ERR_NOENT;
++
++    /* Zero is a wildcard in NVIDIA's version guards; never emit one. */
++    if (cmp_p8_r32(rom + bios) == 0U || rom[bios + 4] == 0U)
++        return CMP_P8_ERR_UNSUP;
++
++    out->rom = rom;
++    out->length = length;
++    out->adjust = adjust;
++    out->token = data;
++    out->version[0] = rom[bios + 3];
++    out->version[1] = rom[bios + 2];
++    out->version[2] = rom[bios + 1];
++    out->version[3] = rom[bios];
++    out->version[4] = rom[bios + 4];
++    return CMP_P8_OK;
++}
++
++static void cmp_p8_emit_record(const cmp_p8_image_t *image, cmp_u32 offset,
++                               const cmp_u8 *data, cmp_u8 size, cmp_u8 *record)
++{
++    cmp_p8_memcpy(record, image->version, 5U);
++    cmp_p8_w32(record + 5, offset);
++    record[9] = size;
++    cmp_p8_memcpy(record + 10, data, size);
++}
++
++static const cmp_u8 *cmp_p8_table(const cmp_p8_image_t *image, cmp_u32 pointer, cmp_u32 bytes)
++{
++    cmp_u32 offset = cmp_p8_r32(image->rom + image->token + pointer);
++
++    if (offset == 0U || offset > (~(cmp_u32)0U - image->adjust))
++        return NULL;
++    offset += image->adjust;
++    return (cmp_p8_range(image->length, offset, bytes) != CMP_P8_OK) ? NULL : (image->rom + offset);
++}
++
++/*
++ * Find the PCI/NPDS image owning the entire edit, including its trailing
++ * checksum byte, verify its existing 8-bit sum is 0, and emit the checksum fix.
++ */
++static int cmp_p8_checksum_record(const cmp_p8_image_t *image, cmp_u32 offset,
++                                  const cmp_u8 *data, cmp_u8 size, cmp_u8 record[CMP_P8_CHECKSUM_SIZE])
++{
++    const cmp_u8 *rom = image->rom;
++    cmp_u32 pos, pcir, bytes, sum, i;
++    cmp_u8 checksum;
++
++    for (pos = 0; pos <= offset; pos += 512U)
++    {
++        if (cmp_p8_range(image->length, pos, 0x1aU) != CMP_P8_OK ||
++            !cmp_p8_rom_signature(cmp_p8_r16(rom + pos)))
++            continue;
++        pcir = pos + cmp_p8_r16(rom + pos + 0x18);
++        if (cmp_p8_range(image->length, pcir, 0x16U) != CMP_P8_OK ||
++            !cmp_p8_data_signature(cmp_p8_r32(rom + pcir)))
++            continue;
++        bytes = (cmp_u32)cmp_p8_r16(rom + pcir + 0x10) * 512U;
++        if (bytes == 0U || cmp_p8_range(image->length, pos, bytes) != CMP_P8_OK ||
++            offset < pos || cmp_p8_range(bytes - 1U, offset - pos, size) != CMP_P8_OK)
++            continue;
++        sum = 0U;
++        for (i = 0; i < bytes; i++)
++            sum = (sum + rom[pos + i]) & 0xffU;
++        if (sum != 0U)
++            return CMP_P8_ERR_BADMSG;
++        for (i = 0; i < size; i++)
++            sum = (sum + data[i] + 256U - rom[offset + i]) & 0xffU;
++        checksum = (cmp_u8)((rom[pos + bytes - 1U] + 256U - sum) & 0xffU);
++        cmp_p8_emit_record(image, pos + bytes - 1U, &checksum, 1U, record);
++        return CMP_P8_OK;
++    }
++    return CMP_P8_ERR_INVAL;
++}
++
++static int cmp_p8_build_overrides(const cmp_u8 *rom, cmp_u64 length, cmp_u16 minimum_mhz,
++                                  cmp_u8 record[CMP_P8_RECORD_SIZE],
++                                  cmp_u8 checksum[CMP_P8_CHECKSUM_SIZE])
++{
++    static const cmp_u8 domains[] = { 0U, 1U, 3U, 5U, 9U }; /* GPC, XBAR, SYS, NVD, HOST */
++    static const cmp_u8 p0_hdr_a[5] = { 0x0fU, 0x08U, 0x03U, 0x00U, 0x00U };
++    static const cmp_u8 p0_hdr_b[5] = { 0x0fU, 0x08U, 0x03U, 0xffU, 0x00U };
++    cmp_p8_image_t image;
++    const cmp_u8 *table;
++    cmp_u32 offset, entry, p0 = 0U, empty = 0U, i;
++    cmp_u8 row[65];
++    int ret;
++
++    if (record == NULL || checksum == NULL || minimum_mhz == 0U || minimum_mhz > 0x3fffU)
++        return CMP_P8_ERR_INVAL;
++
++    ret = cmp_p8_find_image(rom, length, (cmp_u8)'P', 4U, &image);
++    if (ret != CMP_P8_OK)
++        return ret;
++
++    table = cmp_p8_table(&image, 0U, 10U);
++    if (table == NULL)
++        return CMP_P8_ERR_INVAL;
++
++    offset = (cmp_u32)(table - image.rom);
++    /* Only the audited GA100 Performance 0x60 layout is supported. */
++    if (table[0] != 0x60U || table[1] != 10U || table[2] != 5U ||
++        table[3] == 0U || table[4] != 6U || table[5] != 10U ||
++        cmp_p8_range(image.length, (cmp_u64)offset + 10U, (cmp_u64)table[3] * sizeof(row)) != CMP_P8_OK)
++        return CMP_P8_ERR_UNSUP;
++
++    for (i = 0; i < table[3]; i++)
++    {
++        entry = offset + 10U + i * (cmp_u32)sizeof(row);
++        if (image.rom[entry] == 7U)
++            return CMP_P8_ERR_ALREADY; /* Keep a factory P8 intact. */
++        if (image.rom[entry] == 0xffU && empty == 0U)
++            empty = entry;
++        if (image.rom[entry] == 15U)
++        {
++            if (p0 != 0U)
++                return CMP_P8_ERR_BADMSG;
++            p0 = entry;
++        }
++    }
++
++    /*
++     * RM's idle limit uses insertion level zero, so do not put P8 after an
++     * existing state or reorder the factory entries.
++     */
++    if (p0 == 0U || empty != (offset + 10U) ||
++        (!cmp_p8_memeq(image.rom + p0, p0_hdr_a, 5U) &&
++         !cmp_p8_memeq(image.rom + p0, p0_hdr_b, 5U)))
++        return CMP_P8_ERR_UNSUP;
++
++    cmp_p8_memcpy(row, image.rom + p0, (cmp_u32)sizeof(row));
++    /* Reuse the tested P0 power/link policies and clock tuples as P8. */
++    row[0] = 7U;
++    /*
++     * Lower only the requested domain minimum clock floors in P8. Voltage
++     * policy, HBM tuple (domain 2), and factory P0 remain untouched.
++     */
++    for (i = 0; i < (cmp_u32)sizeof(domains); i++)
++    {
++        cmp_u8 *tuple = row + 5U + domains[i] * 6U;
++        cmp_u32 limits = cmp_p8_r32(tuple + 2);
++        cmp_u32 cur_min = limits & 0x3fffU;
++
++        if (cur_min == 0U)
++            return CMP_P8_ERR_UNSUP;
++        if (cur_min > minimum_mhz)
++            cmp_p8_w32(tuple + 2, (limits & ~0x3fffU) | (cmp_u32)minimum_mhz);
++    }
++
++    ret = cmp_p8_checksum_record(&image, empty, row, (cmp_u8)sizeof(row), checksum);
++    if (ret != CMP_P8_OK)
++        return ret;
++    cmp_p8_emit_record(&image, empty, row, (cmp_u8)sizeof(row), record);
++    return CMP_P8_OK;
++}
++
++#endif /* NV_CMP_P8_VBIOS_H */

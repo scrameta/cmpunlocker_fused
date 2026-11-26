@@ -121,9 +121,24 @@ done
 
 step "Checking unlock logs and installed profile"
 if [[ -r /sys/module/nvidia/parameters/cmp_auto ]]; then
-    info "Active nvidia cmp_* options: cmp_auto=$(cat /sys/module/nvidia/parameters/cmp_auto 2>/dev/null) cmp_unlock_vram=$(cat /sys/module/nvidia/parameters/cmp_unlock_vram 2>/dev/null) cmp_unlock_sm=$(cat /sys/module/nvidia/parameters/cmp_unlock_sm 2>/dev/null) cmp_max_pcie_gen=$(cat /sys/module/nvidia/parameters/cmp_max_pcie_gen 2>/dev/null) cmp_bar1_gb=$(cat /sys/module/nvidia/parameters/cmp_bar1_gb 2>/dev/null) cmp_p2p=$(cat /sys/module/nvidia/parameters/cmp_p2p 2>/dev/null || echo '?')"
+    info "Active nvidia cmp_* options: cmp_auto=$(cat /sys/module/nvidia/parameters/cmp_auto 2>/dev/null) cmp_unlock_vram=$(cat /sys/module/nvidia/parameters/cmp_unlock_vram 2>/dev/null) cmp_unlock_sm=$(cat /sys/module/nvidia/parameters/cmp_unlock_sm 2>/dev/null) cmp_max_pcie_gen=$(cat /sys/module/nvidia/parameters/cmp_max_pcie_gen 2>/dev/null) cmp_bar1_gb=$(cat /sys/module/nvidia/parameters/cmp_bar1_gb 2>/dev/null) cmp_p2p=$(cat /sys/module/nvidia/parameters/cmp_p2p 2>/dev/null || echo '?') cmp_p8_low_power=$(cat /sys/module/nvidia/parameters/cmp_p8_low_power 2>/dev/null || echo '?') cmp_p8_vbios=$(cat /sys/module/nvidia/parameters/cmp_p8_vbios 2>/dev/null || echo '?') cmp_hbm_governor=$(cat /sys/module/nvidia/parameters/cmp_hbm_governor 2>/dev/null || echo '?') cmp_p8_min_mhz=$(cat /sys/module/nvidia/parameters/cmp_p8_min_mhz 2>/dev/null || echo '?') cmp_hbm_idle_ms=$(cat /sys/module/nvidia/parameters/cmp_hbm_idle_ms 2>/dev/null || echo '?')"
+    p_auto="$(cat /sys/module/nvidia/parameters/cmp_auto 2>/dev/null || echo 0)"
+    p8_lp="$(cat /sys/module/nvidia/parameters/cmp_p8_low_power 2>/dev/null || echo -1)"
+    p8_vb="$(cat /sys/module/nvidia/parameters/cmp_p8_vbios 2>/dev/null || echo -1)"
+    hbm_gov="$(cat /sys/module/nvidia/parameters/cmp_hbm_governor 2>/dev/null || echo -1)"
+    eff_lp=0
+    if [[ "${p8_lp}" == "1" ]] || [[ "${p8_lp}" == "-1" && "${p_auto}" == "1" ]]; then
+        eff_lp=1
+    fi
+    if [[ "${p8_vb}" == "1" || "${hbm_gov}" == "1" ]] || [[ "${eff_lp}" == "1" && ( "${p8_vb}" != "0" || "${hbm_gov}" != "0" ) ]]; then
+        pwr_info="$(nvidia-smi --query-gpu=pci.bus_id,pstate,power.draw,clocks.gr,clocks.mem --format=csv,noheader 2>/dev/null || true)"
+        if [[ -n "${pwr_info}" ]]; then
+            info "P8 / HBM low-power live telemetry (BDF, pstate, power, gr_clk, mem_clk):"
+            printf '%s\n' "${pwr_info}" | sed 's/^/  /'
+        fi
+    fi
 fi
-sec2_logs="$(dmesg 2>/dev/null | grep -E 'SEC2_DEBUG|CMP (SW-IFF|fuse|PCIe|BAR1|P2P)' || true)"
+sec2_logs="$(dmesg 2>/dev/null | grep -E 'SEC2_DEBUG|CMP (SW-IFF|fuse|PCIe|BAR1|P2P|P8|HBM)' || true)"
 if [[ -n "${sec2_logs}" ]]; then
     ok "dmesg contains CMP unlock logs"
     info "Sample:"

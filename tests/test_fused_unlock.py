@@ -58,11 +58,12 @@ def test_conservative_defaults_in_probe_patch():
     assert "+int cmp_unlock_sm = -1;" in text
     assert "+int cmp_max_pcie_gen = -1;" in text
     assert "+int cmp_bar1_gb = 0;" in text
-    assert "+int cmp_p2p = 1;" in text
 
 
 def test_p2p_patch_trap30_ordering_and_safety():
-    text = (repo.ROOT / "driver" / "patches" / "p2p-unlock.patch").read_text().lower()
+    raw = (repo.ROOT / "driver" / "patches" / "p2p-unlock.patch").read_text()
+    assert "+int cmp_p2p = 1;" in raw
+    text = raw.lower()
     m = re.search(r"p2ptable\[\]\s*=\s*\{(.*?)\};", text, re.S)
     assert m, "p2pTable[] not found in p2p-unlock.patch"
     table = m.group(1)
