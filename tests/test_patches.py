@@ -43,3 +43,10 @@ def test_patches_apply(version):
             r = subprocess.run(["patch", "-p1", "-i", str(PATCHES / name)], cwd=src,
                                stdin=subprocess.DEVNULL, capture_output=True, text=True)
             assert r.returncode == 0, "%s on %s:\n%s%s" % (name, version, r.stdout, r.stderr)
+        nv_pci = (src / "kernel-open" / "nvidia" / "nv-pci.c").read_text()
+        assert "int cmp_p2p = 1;" in nv_pci
+        assert "module_param(cmp_p2p, int, 0444);" in nv_pci
+        assert "int cmp170hx_want_p2p(void)\n{" in nv_pci
+        gsp_c = (src / "src" / "nvidia" / "src" / "kernel" / "gpu" / "gsp" / "kernel_gsp.c").read_text()
+        assert "p2pTable[]" in gsp_c
+        assert "extern int cmp170hx_want_p2p(void);" in gsp_c
