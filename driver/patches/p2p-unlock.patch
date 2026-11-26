@@ -1,0 +1,108 @@
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -5981,6 +5981,105 @@
+                       PCIE_LINK_SPEED_OF(statAfter));
+         }
+ 
++        {
++            extern int cmp170hx_want_p2p(void);
++            if (!cmp170hx_want_p2p())
++            {
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG: CMP P2P unlock disabled (cmp_p2p=0)\n");
++            }
++            else
++            {
++                /*
++                 * Native PCIe mailbox P2P unlock (ported from Zagitta/gpu-unlock 3.0):
++                 * 1. Open PCIe P2P mailbox PLM (0x0013affc = 0xffffffff).
++                 * 2. Configure SYS PRI decode trap 30 (0x00122478..0x00122778; trap 31
++                 *    is reserved) to intercept reads of secure P2P option 0x00821030
++                 *    and return 0.
++                 * Match/mask/data/cfg MUST be installed before arming TRAP_ACTION (0x11).
++                 */
++                static const struct { NvU32 addr; NvU32 value; const char *name; } p2pTable[] = {
++                    { 0x0013affcU, 0xffffffffU, "P2P_PLM" },
++                    { 0x00122778U, 0xfffffb9fU, "P2P_TRAP_PLM" },
++                    { 0x00122478U, 0x00821030U, "P2P_TRAP_MATCH" },
++                    { 0x001224f8U, 0xfc000000U, "P2P_TRAP_MASK" },
++                    { 0x00122578U, 0x00000000U, "P2P_TRAP_DATA1" },
++                    { 0x001225f8U, 0x00000000U, "P2P_TRAP_DATA2" },
++                    { 0x001226f8U, 0x0003c060U, "P2P_TRAP_CFG" },
++                    { 0x00122678U, 0x00000011U, "P2P_TRAP_ACTION" },
++                };
++                NvU32 p2pSecBefore = GPU_REG_RD32(pGpu, 0x00821030U);
++                NvU32 pi, pattempt;
++                NV_STATUS p2pStatus;
++                NvBool p2pAllOk = NV_TRUE;
++
++                for (pi = 0; pi < NV_ARRAY_ELEMENTS(p2pTable); pi++)
++                {
++                    NvBool wrote = NV_FALSE;
++                    for (pattempt = 0; pattempt < 2 && !wrote; pattempt++)
++                    {
++                        NvU32 rd;
++                        GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
++                        GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
++
++                        p2pStatus = kgspSec2PostblTimingRefillPayload(pGpu, pKernelGsp,
++                            p2pTable[pi].addr, p2pTable[pi].value);
++                        if (p2pStatus != NV_OK)
++                            continue;
++
++                        p2pStatus = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
++                            memdescGetPhysAddr(SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp), AT_GPU, 0));
++
++                        rd = GPU_REG_RD32(pGpu, p2pTable[pi].addr);
++                        NV_PRINTF(LEVEL_ERROR,
++                                  "SEC2_DEBUG: P2P[%u] %s(0x%x)=0x%08x attempt=%u status=0x%x rd=0x%08x\n",
++                                  pi, p2pTable[pi].name, p2pTable[pi].addr,
++                                  p2pTable[pi].value, pattempt, p2pStatus, rd);
++                        if (rd == p2pTable[pi].value)
++                            wrote = NV_TRUE;
++                    }
++                    if (!wrote)
++                    {
++                        NV_PRINTF(LEVEL_ERROR,
++                                  "SEC2_DEBUG: CMP P2P FAILED to write %s(0x%x); aborting trap arm\n",
++                                  p2pTable[pi].name, p2pTable[pi].addr);
++                        p2pAllOk = NV_FALSE;
++                        break;
++                    }
++                    /* Ensure trap 30 is disarmed before programming match/mask/data/cfg. */
++                    if (pi == 1U)
++                        GPU_REG_WR32(pGpu, 0x00122678U, 0x00000000U);
++                }
++
++                GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
++                GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
++
++                if (p2pAllOk)
++                {
++                    NvU32 p2pSecAfter = GPU_REG_RD32(pGpu, 0x00821030U);
++                    if (p2pSecAfter != 0U)
++                    {
++                        GPU_REG_WR32(pGpu, 0x00122678U, 0x00000000U);
++                        NV_PRINTF(LEVEL_ERROR,
++                                  "SEC2_DEBUG: CMP P2P secure-option read override failed (0x821030=0x%08x); trap 30 disarmed\n",
++                                  p2pSecAfter);
++                    }
++                    else
++                    {
++                        NV_PRINTF(LEVEL_ERROR,
++                                  "SEC2_DEBUG: CMP P2P mailbox permissions and read override enabled (0x821030 0x%08x->0x%08x PLM=0x%08x TRAP_PLM=0x%08x)\n",
++                                  p2pSecBefore, p2pSecAfter,
++                                  GPU_REG_RD32(pGpu, 0x0013affcU),
++                                  GPU_REG_RD32(pGpu, 0x00122778U));
++                    }
++                }
++                else if (pi > 1U)
++                {
++                    GPU_REG_WR32(pGpu, 0x00122678U, 0x00000000U);
++                }
++            }
++        }
++
+         {
+             static const struct { NvU32 addr; NvU32 val; NvU32 isOr; } eccRcp[] = {
+                 { 0x001fa7ccU, 0xffffffffU, 0U },

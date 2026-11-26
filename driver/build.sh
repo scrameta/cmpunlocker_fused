@@ -61,6 +61,7 @@ PATCH_ORDER=(
     ecc-enable.patch
     ecc-fbpa-static.patch
     ecc-reporting.patch
+    p2p-unlock.patch
 )
 PATCH_FILES=()
 for name in "${PATCH_ORDER[@]}"; do

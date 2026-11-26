@@ -1,6 +1,6 @@
 --- a/kernel-open/nvidia/nv-pci.c
 +++ b/kernel-open/nvidia/nv-pci.c
-@@ -36,6 +36,744 @@
+@@ -36,6 +36,755 @@
  #include <linux/jiffies.h>
  #include <linux/kernel.h>
  #include <linux/workqueue.h>
@@ -15,6 +15,7 @@
 + *   - 74 SMs (or whatever permanent FF fuses already enable)
 + *   - PCIe Gen2
 + *   - Auto BAR1 (64 GB for <=64 GB VRAM, 128 GB for >64 GB VRAM)
++ *   - Native PCIe mailbox P2P (cmp_p2p=1)
 + *
 + * Set cmp_auto=1 to automatically enable every supported feature allowed by
 + * each card's live fuses, non-defective floorplan, and host PCIe root port,
@@ -26,6 +27,7 @@
 +int cmp_max_pcie_gen = -1;
 +int cmp_pcie_retrain = 1;
 +int cmp_bar1_gb = 0;
++int cmp_p2p = 1;
 +int cmp_magicd_a100 = 0;
 +char *cmp_bdf = "";
 +
@@ -47,6 +49,9 @@
 +module_param(cmp_bar1_gb, int, 0444);
 +MODULE_PARM_DESC(cmp_bar1_gb,
 +    "CMP 170HX: BAR1 resize target in GiB (0=auto [64G for <=64G VRAM, 128G for >64G], 64=64G, 128=128G)");
++module_param(cmp_p2p, int, 0444);
++MODULE_PARM_DESC(cmp_p2p,
++    "CMP 170HX: native PCIe mailbox P2P unlock via P2P PLM + SYS decode trap 30 (1=enabled default, 0=disabled)");
 +module_param(cmp_magicd_a100, int, 0444);
 +MODULE_PARM_DESC(cmp_magicd_a100,
 +    "CMP 170HX: also clear extra A100 parity bits 0x14480000 in PCIE_MAGIC_BITS_D on Gen4 SW override (0=bit25 only default, 1=A100 parity)");
@@ -64,6 +69,7 @@
 +                               unsigned int dev, unsigned int fn);
 +int cmp170hx_want_pcie_retrain(void);
 +int cmp170hx_want_bar1_gb(void);
++int cmp170hx_want_p2p(void);
 +int cmp170hx_want_magicd_a100(void);
 +
 +int cmp170hx_bdf_matches(unsigned int domain, unsigned int bus,
@@ -151,6 +157,11 @@
 +int cmp170hx_want_bar1_gb(void)
 +{
 +    return cmp_bar1_gb;
++}
++
++int cmp170hx_want_p2p(void)
++{
++    return (cmp_p2p != 0) ? 1 : 0;
 +}
 +
 +int cmp170hx_want_magicd_a100(void)
