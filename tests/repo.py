@@ -32,3 +32,11 @@ def patch_order():
     m = re.search(r"PATCH_ORDER=\(\n(.*?)\n\)", text, re.S)
     assert m, "PATCH_ORDER not found in driver/build.sh"
     return m.group(1).split()
+
+
+def compat_patches():
+    text = (ROOT / "driver" / "build.sh").read_text()
+    m = re.search(r"COMPAT_PATCHES=\(\n(.*?)\n\)", text, re.S)
+    if not m:
+        return []
+    return m.group(1).split()
