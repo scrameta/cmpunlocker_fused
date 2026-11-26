@@ -182,6 +182,7 @@ Every GPU (`10de:20c2` / `10de:2082`) is evaluated independently at runtime base
 | `cmp_hbm_governor=-1\|0\|1` | `-1` | `-1` = follow `cmp_p8_low_power`. `0` = disable HBM governor. `1` = enable activity-based HBM idle governor (540 MHz / refresh 48 when idle, `stop_machine()` CPU hold during ~2 ms FB-stop switch, instant restore on activity/suspend/unbind). |
 | `cmp_p8_min_mhz=N` | `135` | Minimum idle clock floor in MHz for P8 VBIOS override domains (GPC, XBAR, SYS, NVD, HOST; valid `1..16383`). |
 | `cmp_hbm_idle_ms=N` | `5000` | Quiet time in milliseconds before the HBM governor lowers the HBM clock (default `5000` ms to avoid transition churn during LLM model loads; minimum `100` ms). |
+| `cmp_hbm_min_cycles=N` | `8192` | Minimum delta cycles per 20 ms poll on non-FB-only PMU counters (GR/CE or `610.xx` combined slots) to wake HBM — filters tiny periodic GSP housekeeping pulses (~2,890 cycles every 7.15 s on `615.xx`) while pure FB counters (`slot 1`) still wake immediately on any `delta > 0`. Set `1` for strict any-non-zero behavior; also writable at runtime via `/sys/module/nvidia/parameters/cmp_hbm_min_cycles`. |
 | `cmp_bdf=""` | `""` | Optional comma-separated PCI BDF filter (e.g. `0000:01:00.0`) limiting advanced options (including P8 low-power mode) to specific GPUs. |
 
 ### Native PCIe P2P

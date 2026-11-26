@@ -1,9 +1,9 @@
 diff --git a/kernel-open/nvidia/nv-cmp-hbm.h b/kernel-open/nvidia/nv-cmp-hbm.h
 new file mode 100644
-index 0000000..908e2b0
+index 0000000..f307c44
 --- /dev/null
 +++ b/kernel-open/nvidia/nv-cmp-hbm.h
-@@ -0,0 +1,972 @@
+@@ -0,0 +1,1015 @@
 +/*
 + * SPDX-License-Identifier: GPL-2.0-only
 + *
@@ -35,12 +35,14 @@ index 0000000..908e2b0
 +#include <uapi/linux/pci_regs.h>
 +#endif
 +
-+#define CMP_HBM_POLL_MS          20U
-+#define CMP_HBM_RETRY_MS         1000U
-+#define CMP_HBM_DEFAULT_IDLE_MS  5000U
-+#define CMP_HBM_IDLE_NDIV        20U
-+#define CMP_HBM_IDLE_PLDIV       1U
-+#define CMP_HBM_IDLE_REFRESH     48U
++#define CMP_HBM_POLL_MS            20U
++#define CMP_HBM_RETRY_MS           1000U
++#define CMP_HBM_DEFAULT_IDLE_MS    5000U
++#define CMP_HBM_DEFAULT_MIN_CYCLES 8192U
++#define CMP_HBM_IDLE_NDIV          20U
++#define CMP_HBM_IDLE_PLDIV         1U
++#define CMP_HBM_IDLE_REFRESH       48U
++#define CMP_HBM_FB_MASK0           0x00000080U
 +
 +#define CMP_HBM_FBPA_BASE        0x00900000U
 +#define CMP_HBM_FBPA_STRIDE      0x00004000U
@@ -82,7 +84,7 @@ index 0000000..908e2b0
 +};
 +
 +struct cmp_hbm_policy {
-+    u32 ndiv, pldiv, refresh, idle_ms;
++    u32 ndiv, pldiv, refresh, idle_ms, min_cycles;
 +    enum cmp_hbm_mode mode;
 +};
 +
@@ -94,6 +96,7 @@ index 0000000..908e2b0
 +    struct cmp_hbm_policy policy;
 +    struct cmp_hbm_counter counter[16];
 +    u16 counters, active_counters;
++    u32 max_delta;
 +    u32 fbpas, first_fbpa, busy_coeff, idle_coeff, busy_refresh[24];
 +    u64 sampled, quiet_since;
 +    bool profile, baseline, idle, fb_stopped;
@@ -137,11 +140,12 @@ index 0000000..908e2b0
 +static void cmp_hbm_init(struct cmp_hbm *hbm, u32 idle_ms)
 +{
 +    memset(hbm, 0, sizeof(*hbm));
-+    hbm->policy.ndiv    = CMP_HBM_IDLE_NDIV;
-+    hbm->policy.pldiv   = CMP_HBM_IDLE_PLDIV;
-+    hbm->policy.refresh = CMP_HBM_IDLE_REFRESH;
-+    hbm->policy.idle_ms = (idle_ms >= 100U) ? idle_ms : CMP_HBM_DEFAULT_IDLE_MS;
-+    hbm->policy.mode    = CMP_HBM_AUTO;
++    hbm->policy.ndiv       = CMP_HBM_IDLE_NDIV;
++    hbm->policy.pldiv      = CMP_HBM_IDLE_PLDIV;
++    hbm->policy.refresh    = CMP_HBM_IDLE_REFRESH;
++    hbm->policy.idle_ms    = (idle_ms >= 100U) ? idle_ms : CMP_HBM_DEFAULT_IDLE_MS;
++    hbm->policy.min_cycles = CMP_HBM_DEFAULT_MIN_CYCLES;
++    hbm->policy.mode       = CMP_HBM_AUTO;
 +}
 +
 +static void cmp_hbm_reset(struct cmp_hbm *hbm)
@@ -565,14 +569,28 @@ index 0000000..908e2b0
 +    return true;
 +}
 +
++/*
++ * Pure framebuffer counter (mask0 == 0x80 only, as configured by 615.xx GSP
++ * in slot 1). Any non-zero delta represents real HBM traffic and wakes
++ * immediately; non-FB-only counters (GR/CE or 610.xx combined slots) require
++ * delta >= policy.min_cycles so tiny periodic GSP housekeeping pulses (~2890
++ * cycles every 7.15 s on 615.xx) do not churn the HBM PLL.
++ */
++static bool cmp_hbm_counter_is_fb_only(const struct cmp_hbm_counter *c)
++{
++    return c->mask[0] == CMP_HBM_FB_MASK0 && c->mask[1] == 0U && c->mask[2] == 0U;
++}
++
 +static int cmp_hbm_poll(struct cmp_hbm *hbm, void __iomem *bar, u64 now)
 +{
 +    bool busy = false;
++    u32 min_cycles = (hbm->policy.min_cycles >= 1U) ? hbm->policy.min_cycles : 1U;
 +    unsigned int i;
 +    int ret;
 +
 +    hbm->reason = NULL;
 +    hbm->active_counters = 0U;
++    hbm->max_delta = 0U;
 +    if (!cmp_hbm_booted(bar))
 +    {
 +        u32 boot = readl(bar + CMP_HBM_GFW_BOOT);
@@ -638,9 +656,18 @@ index 0000000..908e2b0
 +            goto unknown;
 +        }
 +        c.delta = (c.count - previous->count) & CMP_HBM_COUNT_MASK;
++        if (c.delta > hbm->max_delta)
++            hbm->max_delta = c.delta;
 +        if (c.delta != 0U)
-+            hbm->active_counters |= (u16)(1U << i);
-+        busy |= (c.delta != 0U);
++        {
++            u32 threshold = cmp_hbm_counter_is_fb_only(&c) ? 1U : min_cycles;
++
++            if (c.delta >= threshold)
++            {
++                hbm->active_counters |= (u16)(1U << i);
++                busy = true;
++            }
++        }
 +        *previous = c;
 +    }
 +    hbm->sampled = now;
@@ -660,6 +687,18 @@ index 0000000..908e2b0
 +}
 +
 +#ifdef __KERNEL__
++
++static int cmp_hbm_min_cycles = (int)CMP_HBM_DEFAULT_MIN_CYCLES;
++module_param(cmp_hbm_min_cycles, int, 0644);
++MODULE_PARM_DESC(cmp_hbm_min_cycles,
++    "CMP 170HX: minimum non-FB-only PMU counter delta cycles per 20ms poll to wake HBM (default: 8192; 1=strict any non-zero)");
++
++static u32 cmp170hx_get_hbm_min_cycles(void)
++{
++    int val = READ_ONCE(cmp_hbm_min_cycles);
++
++    return (val <= 1) ? 1U : (u32)val;
++}
 +
 +struct cmp_hbm_worker {
 +    struct list_head node;
@@ -735,6 +774,7 @@ index 0000000..908e2b0
 +    u64 start = ktime_get_ns();
 +    int ret;
 +
++    hbm->policy.min_cycles = cmp170hx_get_hbm_min_cycles();
 +    ret = cmp_hbm_poll(hbm, worker->bar, start);
 +    if (!was_profile && hbm->profile)
 +    {
@@ -752,9 +792,10 @@ index 0000000..908e2b0
 +    {
 +        u64 elapsed_us = (ktime_get_ns() - start) / 1000ULL;
 +        dev_dbg(&worker->pdev->dev,
-+                "CMP HBM: %s -> %s coeff=0x%x elapsed_us=%llu\n",
++                "CMP HBM: %s -> %s coeff=0x%x active=0x%x max_delta=%u elapsed_us=%llu\n",
 +                was_idle ? "idle" : "busy", hbm->idle ? "idle" : "busy",
 +                readl(worker->bar + hbm->first_fbpa + CMP_HBM_PLL_COEFF),
++                hbm->active_counters, hbm->max_delta,
 +                (unsigned long long)elapsed_us);
 +    }
 +    if (ret)
@@ -904,6 +945,7 @@ index 0000000..908e2b0
 +
 +    idle_ms = cmp170hx_get_hbm_idle_ms();
 +    cmp_hbm_init(&worker->hbm, idle_ms);
++    worker->hbm.policy.min_cycles = cmp170hx_get_hbm_min_cycles();
 +    worker->pdev = pdev;
 +    mutex_init(&worker->lock);
 +    INIT_DELAYED_WORK(&worker->work, cmp_hbm_poll_work);
@@ -934,9 +976,10 @@ index 0000000..908e2b0
 +    mutex_unlock(&cmp_hbm_list_lock);
 +
 +    dev_info(&pdev->dev,
-+             "CMP HBM: governor registered idle_ms=%u poll_ms=%u idle_ndiv=%u idle_pldiv=%u idle_refresh=%u transition=stop_machine/fb-stop/bypass\n",
-+             worker->hbm.policy.idle_ms, CMP_HBM_POLL_MS,
-+             CMP_HBM_IDLE_NDIV, CMP_HBM_IDLE_PLDIV, CMP_HBM_IDLE_REFRESH);
++             "CMP HBM: governor registered idle_ms=%u min_cycles=%u poll_ms=%u idle_ndiv=%u idle_pldiv=%u idle_refresh=%u transition=stop_machine/fb-stop/bypass\n",
++             worker->hbm.policy.idle_ms, worker->hbm.policy.min_cycles,
++             CMP_HBM_POLL_MS, CMP_HBM_IDLE_NDIV, CMP_HBM_IDLE_PLDIV,
++             CMP_HBM_IDLE_REFRESH);
 +    cmp_hbm_queue(worker, 0);
 +}
 +
