@@ -42,6 +42,8 @@ def test_p8_low_power_conservative_defaults():
     assert "+int cmp_hbm_governor = -1;" in text
     assert "+int cmp_p8_min_mhz = 135;" in text
     assert "+int cmp_hbm_idle_ms = 5000;" in text
+    assert "+#define CMP_HBM_DEFAULT_MIN_CYCLES 8192U" in text
+    assert "+module_param(cmp_hbm_min_cycles, int, 0644);" in text
     assert "stop_machine(cmp_hbm_switch_profile" in text
 
 
@@ -282,8 +284,9 @@ struct sim_card {
     u32 refresh[24], coeff[24], cfg;
     u32 refresh_plm, pll_plm;
     u32 gfw_boot, gsp_status;
-    u32 request, ack, count;
+    u32 request, ack, count, fb_count;
     u32 counter_ctrl;
+    bool split_counters; /* true: 615.xx layout (slot 0 GR+CE, slot 1 pure FB) */
     unsigned int lock_reads, lock_wait;
     unsigned int stop_machine_calls, clock_writes, sw_refreshes;
     bool cpus_held;
@@ -341,11 +344,16 @@ static u32 readl(const void *addr) {
     case CMP_HBM_GSP_RISCV_STATUS: return card.gsp_status;
     case CMP_HBM_FB_STOP_OUTPUT:   return 0x3ffffc00U | card.request;
     case CMP_HBM_FB_STOP_INPUT:    return 0x00501400U | card.ack;
-    case 0x0010be40U:              return 0x00380081U;
+    case 0x0010be40U:              return card.split_counters ? 0x00380001U : 0x00380081U;
     case 0x0010be80U:              return 0x00700000U;
     case 0x0010bec0U:              return 0x00000007U;
     case 0x0010bfc0U:              return card.counter_ctrl;
     case 0x0010bf80U:              return card.count;
+    case 0x0010be44U:              return card.split_counters ? 0x00000080U : 0U;
+    case 0x0010be84U:              return 0U;
+    case 0x0010bec4U:              return 0U;
+    case 0x0010bfc4U:              return card.split_counters ? card.counter_ctrl : 0U;
+    case 0x0010bf84U:              return card.fb_count;
     }
     return 0U;
 }
@@ -477,11 +485,79 @@ static void test_topology(u32 mask, unsigned int expected_fbpas) {
     assert(!hbm.idle && !hbm.fb_stopped);
 }
 
+static void test_housekeeping_threshold(void) {
+    struct cmp_hbm hbm;
+    u64 t = 1000ULL * MS;
+
+    /* 615.xx split layout: slot 0 = GR+CE0..8, slot 1 = pure FB (0x80). */
+    reset_card(0x003fcfffU);
+    card.split_counters = true;
+    cmp_hbm_init(&hbm, 100U);
+    assert(hbm.policy.min_cycles == CMP_HBM_DEFAULT_MIN_CYCLES);
+
+    assert(cmp_hbm_poll(&hbm, fake_bar, t) == 0);
+    assert(hbm.counters == 0x3U);
+
+    /* Periodic ~2890-cycle GSP housekeeping blip on slot 0 while busy does not block idle. */
+    for (unsigned int i = 0; i < 5U; i++) {
+        if (i == 2U) card.count += 2890U;
+        t += 20ULL * MS;
+        assert(cmp_hbm_poll(&hbm, fake_bar, t) == 0);
+    }
+    assert(hbm.idle);
+    assert(card.stop_machine_calls == 1U);
+
+    /* Once idle, another 2890-cycle GR/CE blip with zero FB delta stays idle. */
+    card.count += 2890U;
+    t += 20ULL * MS;
+    assert(cmp_hbm_poll(&hbm, fake_bar, t) == 0);
+    assert(hbm.idle);
+    assert(hbm.active_counters == 0U);
+    assert(hbm.max_delta == 2890U);
+    assert(card.stop_machine_calls == 1U);
+
+    /* Pure FB counter (slot 1) wakes immediately even on delta == 1. */
+    card.fb_count += 1U;
+    t += 20ULL * MS;
+    assert(cmp_hbm_poll(&hbm, fake_bar, t) == 0);
+    assert(!hbm.idle);
+    assert(hbm.active_counters == (1U << 1));
+    assert(hbm.max_delta == 1U);
+    assert(card.stop_machine_calls == 2U);
+
+    /* Return to idle, then verify real GR/CE work (>= min_cycles) wakes immediately. */
+    for (unsigned int i = 0; i < 5U; i++) {
+        t += 20ULL * MS;
+        assert(cmp_hbm_poll(&hbm, fake_bar, t) == 0);
+    }
+    assert(hbm.idle);
+    card.count += CMP_HBM_DEFAULT_MIN_CYCLES;
+    t += 20ULL * MS;
+    assert(cmp_hbm_poll(&hbm, fake_bar, t) == 0);
+    assert(!hbm.idle);
+    assert(hbm.active_counters == (1U << 0));
+    assert(hbm.max_delta == CMP_HBM_DEFAULT_MIN_CYCLES);
+
+    /* Setting min_cycles=1 restores strict delta != 0 on slot 0. */
+    for (unsigned int i = 0; i < 5U; i++) {
+        t += 20ULL * MS;
+        assert(cmp_hbm_poll(&hbm, fake_bar, t) == 0);
+    }
+    assert(hbm.idle);
+    hbm.policy.min_cycles = 1U;
+    card.count += 2890U;
+    t += 20ULL * MS;
+    assert(cmp_hbm_poll(&hbm, fake_bar, t) == 0);
+    assert(!hbm.idle);
+    assert(hbm.active_counters == (1U << 0));
+}
+
 int main(void) {
     /* 8-FBP (16 FBPA), 10-FBP (20 FBPA), and 12-FBP (24 FBPA) CMP 170HX layouts. */
     test_topology(0x0000ffffU, 16U);
     test_topology(0x003fcfffU, 20U);
     test_topology(0x00ffffffU, 24U);
+    test_housekeeping_threshold();
 
     /* PLL lock timeout rolls back cleanly and resumes FB. */
     struct cmp_hbm hbm;
@@ -526,7 +602,11 @@ def test_install_sh_p8_cli_flags():
         capture_output=True, text=True,
     )
     assert r.returncode == 0, r.stderr
-    for flag in ("--p8-low-power", "--no-p8-low-power", "--p8-vbios", "--no-hbm-governor", "--p8-min-mhz=N", "--hbm-idle-ms=N"):
+    for flag in (
+        "--p8-low-power", "--no-p8-low-power", "--p8-vbios",
+        "--no-hbm-governor", "--p8-min-mhz=N", "--hbm-idle-ms=N",
+        "--hbm-min-cycles=N",
+    ):
         assert flag in r.stdout
 
     bad_mhz = subprocess.run(
@@ -539,3 +619,8 @@ def test_install_sh_p8_cli_flags():
         capture_output=True, text=True,
     )
     assert bad_idle.returncode != 0
+    bad_cycles = subprocess.run(
+        ["bash", str(repo.ROOT / "install.sh"), "--hbm-min-cycles=0"],
+        capture_output=True, text=True,
+    )
+    assert bad_cycles.returncode != 0

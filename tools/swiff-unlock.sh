@@ -64,7 +64,7 @@ cmd_status() {
     local -a gpus=()
     local gpu dev speed width driver
     echo "Module parameters (/sys/module/nvidia/parameters):"
-    for p in cmp_auto cmp_unlock_vram cmp_unlock_sm cmp_max_pcie_gen cmp_pcie_retrain cmp_bar1_gb cmp_p2p cmp_magicd_a100 cmp_p8_low_power cmp_p8_vbios cmp_hbm_governor cmp_p8_min_mhz cmp_hbm_idle_ms cmp_bdf; do
+    for p in cmp_auto cmp_unlock_vram cmp_unlock_sm cmp_max_pcie_gen cmp_pcie_retrain cmp_bar1_gb cmp_p2p cmp_magicd_a100 cmp_p8_low_power cmp_p8_vbios cmp_hbm_governor cmp_p8_min_mhz cmp_hbm_idle_ms cmp_hbm_min_cycles cmp_bdf; do
         printf "  %-18s = %s\n" "${p}" "$(read_modparam "${p}")"
     done
     echo ""
