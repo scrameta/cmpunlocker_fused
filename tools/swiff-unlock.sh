@@ -34,6 +34,9 @@ Commands:
   undo <bdf> [--flr]     Disarm SW-IFF overlay (GPU must be unbound; --flr reverts now)
   rebind                 Rebind GPUs that logged closed cold-boot PLMs so nvidia.ko
                          arms SW-IFF + FLR automatically (used by ${SERVICE_NAME})
+  pcie-settle            Re-initialise (open/close, no unbind) any GPU whose GSP-RM
+                         booted before the probe-time Gen3/Gen4 retrain, so nvidia-smi
+                         reports the real link generation (used by ${SERVICE_NAME})
   install-service        Install and enable ${SERVICE_NAME} for cold-boot SW-IFF
   remove-service         Disable and remove ${SERVICE_NAME}
 EOF
@@ -333,6 +336,100 @@ cmd_rebind() {
     fi
 }
 
+# PCIe generation from sysfs current_link_speed ("16.0 GT/s PCIe" -> 4).
+link_gen_from_sysfs() {
+    local s
+    s="$(cat "/sys/bus/pci/devices/$1/current_link_speed" 2>/dev/null || true)"
+    case "${s%% *}" in
+        2.5)    echo 1 ;;
+        5|5.0)  echo 2 ;;
+        8|8.0)  echo 3 ;;
+        16|16.0) echo 4 ;;
+        32|32.0) echo 5 ;;
+        *)      echo 0 ;;
+    esac
+}
+
+# Link generation as GSP-RM sees it. Without persistence, this open also
+# initialises the GPU (GSP boot + post-GSP PHY sequence + probe-time retrain).
+smi_gen_max() {
+    local v
+    v="$(nvidia-smi -i "$1" --query-gpu=pcie.link.gen.max --format=csv,noheader,nounits 2>/dev/null \
+         | head -n1 | tr -d ' ')" || true
+    if [[ "${v}" =~ ^[0-9]+$ ]]; then echo "${v}"; else echo 0; fi
+}
+
+# PIDs holding this GPU's /dev/nvidiaN open (empty if none / fuser missing).
+gpu_holders() {
+    local minor
+    minor="$(awk -F: '/Device Minor/ {gsub(/[ \t]/, "", $2); print $2}' \
+             "/proc/driver/nvidia/gpus/$1/information" 2>/dev/null || true)"
+    [[ -n "${minor}" && -e "/dev/nvidia${minor}" ]] || return 0
+    command -v fuser >/dev/null 2>&1 || return 0
+    fuser "/dev/nvidia${minor}" 2>/dev/null | tr -s ' ' | sed 's/^ //' || true
+}
+
+cmd_pcie_settle() {
+    require_root
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        info "nvidia-smi not found; skipping PCIe settle"
+        return 0
+    fi
+
+    local -a gpus=()
+    mapfile -t gpus < <(supported_gpus)
+    mkdir -p /run/cmp-swiff
+
+    local bdf drv smi link pm holders marker
+    for bdf in "${gpus[@]}"; do
+        drv="$(basename "$(readlink -f "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || true)"
+        [[ "${drv}" == "nvidia" ]] || continue
+
+        # Per the driver: the Gen3/Gen4 retrain runs in nv_start_device() right
+        # after rm_init_adapter(), i.e. after GSP-RM has already sampled the link.
+        # GSP-RM only reports the real generation if it boots again afterwards.
+        smi="$(smi_gen_max "${bdf}")"
+        link="$(link_gen_from_sysfs "${bdf}")"
+        if (( smi == 0 || link == 0 )); then
+            warn "${bdf}: could not read link generation (nvidia-smi=${smi} sysfs=${link}); skipping"
+            continue
+        fi
+        if (( smi >= link )); then
+            ok "${bdf}: GSP-RM reports Gen${smi} max, link is Gen${link}; nothing to do"
+            continue
+        fi
+
+        marker="/run/cmp-swiff/${bdf}.pcie-settled"
+        if [[ -e "${marker}" ]]; then
+            warn "${bdf}: already re-initialised once this boot and GSP-RM still reports Gen${smi} (link Gen${link}); not retrying"
+            continue
+        fi
+
+        # Never unbind: nv_pci_remove() blocks forever while the GPU is in use.
+        # A re-init only happens if nothing keeps the adapter alive.
+        pm="$(nvidia-smi -i "${bdf}" --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null \
+              | head -n1 | tr -d ' ')" || true
+        holders="$(gpu_holders "${bdf}")"
+        if [[ "${pm}" == "Enabled" || -n "${holders}" ]]; then
+            warn "${bdf}: GSP-RM reports Gen${smi} but link is Gen${link}; GPU is kept open (persistence=${pm:-?} pids=${holders:-none})."
+            warn "${bdf}: stop nvidia-persistenced / those processes, run 'cmp-swiff-unlock pcie-settle', then restart them"
+            continue
+        fi
+
+        touch "${marker}"
+        info "${bdf}: GSP-RM booted before the Gen${link} retrain (reports Gen${smi}); re-initialising once"
+        # Previous nvidia-smi closed the last handle -> adapter shut down; this
+        # open boots GSP-RM again with the link already at Gen${link}.
+        smi="$(smi_gen_max "${bdf}")"
+        link="$(link_gen_from_sysfs "${bdf}")"
+        if (( smi >= link )); then
+            ok "${bdf}: GSP-RM now reports Gen${smi} max (link Gen${link})"
+        else
+            warn "${bdf}: GSP-RM still reports Gen${smi} max (link Gen${link}) after re-init"
+        fi
+    done
+}
+
 cmd_install_service() {
     require_root
     [[ -f "${SERVICE_SOURCE}" ]] || die "Missing ${SERVICE_SOURCE}"
@@ -358,6 +455,7 @@ case "${1:-}" in
     arm)             shift; cmd_arm "$@" ;;
     undo)            shift; cmd_undo "$@" ;;
     rebind)          cmd_rebind ;;
+    pcie-settle)     cmd_pcie_settle ;;
     install-service) cmd_install_service ;;
     remove-service)  cmd_remove_service ;;
     -h|--help|"")    usage ;;

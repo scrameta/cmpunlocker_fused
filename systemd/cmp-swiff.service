@@ -1,13 +1,14 @@
 [Unit]
-Description=CMP 170HX cold-boot SW-IFF rebind helper (RIR-unlocked GPUs)
+Description=CMP 170HX cold-boot SW-IFF rebind + PCIe gen re-init helper
 After=systemd-modules-load.service local-fs.target
 Before=nvidia-persistenced.service docker.service
 ConditionPathExists=/usr/local/sbin/cmp-swiff-unlock
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/cmp-swiff-unlock rebind
-TimeoutStartSec=60
+ExecStart=-/usr/local/sbin/cmp-swiff-unlock rebind
+ExecStart=-/usr/local/sbin/cmp-swiff-unlock pcie-settle
+TimeoutStartSec=180
 RemainAfterExit=no
 
 [Install]
