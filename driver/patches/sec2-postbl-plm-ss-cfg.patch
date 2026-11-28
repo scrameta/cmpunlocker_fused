@@ -9,7 +9,7 @@ diff -Naur a/src/nvidia/generated/g_kernel_gsp_nvoc.h b/src/nvidia/generated/g_k
 diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
 --- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
 +++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
-@@ -101,4 +101,107 @@
+@@ -101,4 +101,167 @@
  #endif
  
 +#define SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID   0x20C2
@@ -45,6 +45,12 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +    return c;
 +}
 +
++static NvBool
++_kgspCmp170hxRegReadable(NvU32 v)
++{
++    return (v != 0xffffffffU) && ((v & 0xffff0000U) != 0xbadf0000U);
++}
++
 +static void
 +_kgspCmp170hxComputeGeometry(OBJGPU *pGpu, NvU32 *pCfg1, NvU32 *pLmr,
 +                             NvU64 *pFbBytes, NvU32 *pActiveFbps)
@@ -57,54 +63,108 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +    NvU32 statusFbpa = GPU_REG_RD32(pGpu, 0x00820c18U);
 +    NvU32 statusFbio = GPU_REG_RD32(pGpu, 0x00820c14U);
 +    NvU32 numActive  = GPU_REG_RD32(pGpu, 0x009a0164U);
++    NvU32 fullFbps   = 0;
++    NvU32 halfFbps   = 0;
 +    NvU32 activeFbps = 0;
-+    NvBool coherent = NV_FALSE;
++    NvBool fusesReadable = NV_FALSE;
++    NvBool slicesAligned = NV_TRUE;
++    NvBool numActiveOk   = NV_TRUE;
 +    int allowExtended = cmp170hx_want_unlock_vram(
 +        gpuGetDomain(pGpu), gpuGetBus(pGpu), gpuGetDevice(pGpu), 0U);
 +
-+    if (statusFbp != 0xffffffffU && (statusFbp & 0xffff0000U) != 0xbadf0000U &&
-+        statusFbpa != 0xffffffffU && (statusFbpa & 0xffff0000U) != 0xbadf0000U &&
-+        statusFbio != 0xffffffffU && (statusFbio & 0xffff0000U) != 0xbadf0000U)
++    if (_kgspCmp170hxRegReadable(statusFbp) &&
++        _kgspCmp170hxRegReadable(statusFbpa) &&
++        _kgspCmp170hxRegReadable(statusFbio))
 +    {
-+        NvU32 fbpCnt  = 12U - _kgspCmp170hxPopcount(statusFbp & 0xfffU);
-+        NvU32 fbpaCnt = 24U - _kgspCmp170hxPopcount(statusFbpa & 0xffffffU);
-+        NvU32 fbioCnt = 24U - _kgspCmp170hxPopcount(statusFbio & 0xffffffU);
-+        if (fbpCnt >= 8U && fbpCnt <= 12U &&
-+            fbpaCnt == fbpCnt * 2U && fbioCnt == fbpCnt * 2U &&
-+            (numActive == 0U || numActive == 0xffffffffU || numActive == fbpCnt))
++        NvU32 f;
++        fusesReadable = NV_TRUE;
++        for (f = 0U; f < 12U; f++)
 +        {
-+            activeFbps = fbpCnt;
-+            coherent = NV_TRUE;
++            NvBool fbpActive = ((statusFbp & (1U << f)) == 0U);
++            NvU32 sub     = 0x3U << (2U * f);
++            NvU32 fbpaOff = statusFbpa & sub;
++            NvU32 fbioOff = statusFbio & sub;
++
++            if (fbpaOff != fbioOff)
++                slicesAligned = NV_FALSE;
++
++            if (!fbpActive)
++            {
++                if (fbpaOff != sub || fbioOff != sub)
++                    slicesAligned = NV_FALSE;
++                continue;
++            }
++
++            activeFbps++;
++            if (fbpaOff == 0U && fbioOff == 0U)
++                fullFbps++;
++            else if (fbpaOff == fbioOff && fbpaOff != sub)
++                halfFbps++;
++        }
++
++        if (_kgspCmp170hxRegReadable(numActive) && numActive != 0U &&
++            numActive != fullFbps && numActive != activeFbps)
++        {
++            numActiveOk = NV_FALSE;
 +        }
 +    }
 +
 +    if (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
 +    {
++        NvU32 chosenFbps = 8U;
 +        cfg1Value     = 0x02779000U;
 +        lmrValue      = 0x0000020BU;
 +        targetFbBytes = 0x0000001000000000ULL;
-+        if (allowExtended && coherent && activeFbps > 8U)
++        if (fusesReadable && fullFbps > 0U)
 +        {
-+            lmrValue      = ((activeFbps * 4U) << 4) | 0x0000000BU;
-+            targetFbBytes = (NvU64)activeFbps * 0x0000000200000000ULL;
++            if (fullFbps < 8U)
++                chosenFbps = fullFbps;
++            else if (allowExtended && slicesAligned && numActiveOk && fullFbps > 8U)
++                chosenFbps = fullFbps;
++
++            if (chosenFbps != 8U)
++            {
++                lmrValue      = ((chosenFbps * 4U) << 4) | 0x0000000BU;
++                targetFbBytes = (NvU64)chosenFbps * 0x0000000200000000ULL;
++            }
 +        }
 +    }
 +    else
 +    {
++        NvU32 chosenFbps = 10U;
 +        cfg1Value     = 0x02669000U;
 +        lmrValue      = 0x0000028AU;
 +        targetFbBytes = 0x0000000A00000000ULL;
-+        if (allowExtended && coherent && activeFbps > 10U)
++        if (fusesReadable && fullFbps > 0U)
 +        {
-+            lmrValue      = ((activeFbps * 4U) << 4) | 0x0000000AU;
-+            targetFbBytes = (NvU64)activeFbps * 0x0000000100000000ULL;
++            if (fullFbps < 10U)
++                chosenFbps = fullFbps;
++            else if (allowExtended && slicesAligned && numActiveOk && fullFbps > 10U)
++                chosenFbps = fullFbps;
++
++            if (chosenFbps != 10U)
++            {
++                lmrValue      = ((chosenFbps * 4U) << 4) | 0x0000000AU;
++                targetFbBytes = (NvU64)chosenFbps * 0x0000000100000000ULL;
++            }
 +        }
++    }
++
++    if (pCfg1 != NULL && fusesReadable &&
++        (halfFbps > 0U || fullFbps != activeFbps || !slicesAligned))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "SEC2_DEBUG: FBP floorplan note: fullFbps=%u halfFbps=%u activeFbps=%u "
++                  "aligned=%u (FBP=0x%03x FBPA=0x%06x FBIO=0x%06x NUM_ACTIVE=0x%x) -> sizing from full FBPs (%lluGiB)\n",
++                  fullFbps, halfFbps, activeFbps, slicesAligned ? 1U : 0U,
++                  statusFbp & 0xfffU, statusFbpa & 0xffffffU, statusFbio & 0xffffffU,
++                  numActive, (unsigned long long)(targetFbBytes >> 30));
 +    }
 +
 +    if (pCfg1 != NULL)       *pCfg1 = cfg1Value;
 +    if (pLmr != NULL)        *pLmr = lmrValue;
 +    if (pFbBytes != NULL)    *pFbBytes = targetFbBytes;
-+    if (pActiveFbps != NULL) *pActiveFbps = activeFbps;
++    if (pActiveFbps != NULL) *pActiveFbps = fullFbps;
 +}
 +
 +static NvBool
