@@ -34,7 +34,7 @@ Commands:
   undo <bdf> [--flr]     Disarm SW-IFF overlay (GPU must be unbound; --flr reverts now)
   rebind                 Rebind GPUs that logged closed cold-boot PLMs so nvidia.ko
                          arms SW-IFF + FLR automatically (used by ${SERVICE_NAME})
-  pcie-settle            Re-initialise (open/close, no unbind) any GPU whose GSP-RM
+  pcie-settle            Rebind (once per boot, only if idle) any GPU whose GSP-RM
                          booted before the probe-time Gen3/Gen4 retrain, so nvidia-smi
                          reports the real link generation (used by ${SERVICE_NAME})
   install-service        Install and enable ${SERVICE_NAME} for cold-boot SW-IFF
@@ -350,8 +350,8 @@ link_gen_from_sysfs() {
     esac
 }
 
-# Link generation as GSP-RM sees it. Without persistence, this open also
-# initialises the GPU (GSP boot + post-GSP PHY sequence + probe-time retrain).
+# Link generation as GSP-RM sees it. The first open after a probe initialises
+# the GPU (GSP boot + post-GSP PHY sequence + probe-time retrain).
 smi_gen_max() {
     local v
     v="$(nvidia-smi -i "$1" --query-gpu=pcie.link.gen.max --format=csv,noheader,nounits 2>/dev/null \
@@ -369,6 +369,42 @@ gpu_holders() {
     fuser "/dev/nvidia${minor}" 2>/dev/null | tr -s ' ' | sed 's/^ //' || true
 }
 
+# Unbind+bind as one unit outside this process, so an unexpectedly blocked
+# unbind can neither stall the caller (e.g. boot) nor be killed between the
+# unbind and the bind and leave the GPU without a driver.
+rebind_guarded() {
+    local bdf="$1" unit i
+    local cmd="echo ${bdf} > /sys/bus/pci/drivers/nvidia/unbind && sleep 0.5 && echo ${bdf} > /sys/bus/pci/drivers/nvidia/bind"
+
+    if command -v systemd-run >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        unit="cmp-pcie-rebind-${bdf//[:.]/-}"
+        systemctl reset-failed "${unit}.service" 2>/dev/null || true
+        if ! systemd-run --quiet --no-block --unit="${unit}" \
+                --description="CMP 170HX PCIe settle rebind ${bdf}" \
+                /bin/sh -c "${cmd}"; then
+            warn "${bdf}: systemd-run failed; not rebinding"
+            return 1
+        fi
+        sleep 0.2
+        for (( i = 0; i < 60; i++ )); do
+            systemctl is-active --quiet "${unit}.service" || break
+            sleep 0.5
+        done
+        if systemctl is-active --quiet "${unit}.service"; then
+            warn "${bdf}: unbind still blocked after 30s (GPU in use?); ${unit}.service will rebind it once released"
+            return 1
+        fi
+    else
+        /bin/sh -c "${cmd}" || true
+    fi
+
+    if [[ "$(basename "$(readlink -f "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || true)" != "nvidia" ]]; then
+        err "${bdf}: not bound to nvidia after rebind; run: echo ${bdf} | sudo tee /sys/bus/pci/drivers/nvidia/bind"
+        return 1
+    fi
+    return 0
+}
+
 cmd_pcie_settle() {
     require_root
     if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -380,7 +416,7 @@ cmd_pcie_settle() {
     mapfile -t gpus < <(supported_gpus)
     mkdir -p /run/cmp-swiff
 
-    local bdf drv smi link pm holders marker
+    local bdf drv smi link holders marker
     for bdf in "${gpus[@]}"; do
         drv="$(basename "$(readlink -f "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || true)"
         [[ "${drv}" == "nvidia" ]] || continue
@@ -401,31 +437,34 @@ cmd_pcie_settle() {
 
         marker="/run/cmp-swiff/${bdf}.pcie-settled"
         if [[ -e "${marker}" ]]; then
-            warn "${bdf}: already re-initialised once this boot and GSP-RM still reports Gen${smi} (link Gen${link}); not retrying"
+            warn "${bdf}: already rebound once this boot and GSP-RM still reports Gen${smi} (link Gen${link}); not retrying"
             continue
         fi
 
-        # Never unbind: nv_pci_remove() blocks forever while the GPU is in use.
-        # A re-init only happens if nothing keeps the adapter alive.
-        pm="$(nvidia-smi -i "${bdf}" --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null \
-              | head -n1 | tr -d ' ')" || true
+        # persistent-sw-state.patch keeps GSP-RM booted across close/reopen, so
+        # only a remove/probe (unbind+bind) gives GSP-RM a fresh boot. The unbind
+        # blocks in nv_pci_remove() while anything has the GPU open, so refuse
+        # if any process holds it.
         holders="$(gpu_holders "${bdf}")"
-        if [[ "${pm}" == "Enabled" || -n "${holders}" ]]; then
-            warn "${bdf}: GSP-RM reports Gen${smi} but link is Gen${link}; GPU is kept open (persistence=${pm:-?} pids=${holders:-none})."
+        if [[ -n "${holders}" ]]; then
+            warn "${bdf}: GSP-RM reports Gen${smi} but link is Gen${link}; GPU is in use (pids=${holders})."
             warn "${bdf}: stop nvidia-persistenced / those processes, run 'cmp-swiff-unlock pcie-settle', then restart them"
             continue
         fi
 
         touch "${marker}"
-        info "${bdf}: GSP-RM booted before the Gen${link} retrain (reports Gen${smi}); re-initialising once"
-        # Previous nvidia-smi closed the last handle -> adapter shut down; this
-        # open boots GSP-RM again with the link already at Gen${link}.
+        info "${bdf}: GSP-RM booted before the Gen${link} retrain (reports Gen${smi}); rebinding once"
+        if ! rebind_guarded "${bdf}"; then
+            continue
+        fi
+
+        # First open after the new probe boots GSP-RM with the link already at Gen${link}.
         smi="$(smi_gen_max "${bdf}")"
         link="$(link_gen_from_sysfs "${bdf}")"
         if (( smi >= link )); then
             ok "${bdf}: GSP-RM now reports Gen${smi} max (link Gen${link})"
         else
-            warn "${bdf}: GSP-RM still reports Gen${smi} max (link Gen${link}) after re-init"
+            warn "${bdf}: GSP-RM still reports Gen${smi} max (link Gen${link}) after rebind"
         fi
     done
 }
