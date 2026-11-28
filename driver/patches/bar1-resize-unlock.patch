@@ -1,6 +1,6 @@
 --- a/kernel-open/nvidia/nv-pci.c
 +++ b/kernel-open/nvidia/nv-pci.c
-@@ -337,6 +337,97 @@
+@@ -337,6 +337,116 @@
  #endif
  }
  
@@ -14,7 +14,7 @@
 +    if (opt_gb == 64)
 +        return 64U;
 +
-+    /* Auto-size BAR1: 128 GiB when >64 GiB VRAM is active (80G/96G 0x20C2), else 64 GiB. */
++    /* Auto-size BAR1: 128 GiB when >64 GiB VRAM is active (>8 full FBPs on 0x20C2), else 64 GiB. */
 +    domain = (unsigned int)pci_domain_nr(pci_dev->bus);
 +    bus    = (unsigned int)pci_dev->bus->number;
 +    slot   = (unsigned int)PCI_SLOT(pci_dev->devfn);
@@ -27,18 +27,37 @@
 +        void __iomem *fuse = ioremap(bar0_start + 0x00820000ULL, 0x1000);
 +        if (fuse != NULL)
 +        {
-+            u32 fbp_stat = readl(fuse + 0xD38);
++            u32 fbp_stat  = readl(fuse + 0xD38);
++            u32 fbpa_stat = readl(fuse + 0xC18);
++            u32 fbio_stat = readl(fuse + 0xC14);
 +            iounmap(fuse);
-+            if ((fbp_stat != 0xFFFFFFFFU) && ((fbp_stat & 0xFFFF0000U) != 0xBADF0000U))
++            if ((fbp_stat  != 0xFFFFFFFFU) && ((fbp_stat  & 0xFFFF0000U) != 0xBADF0000U) &&
++                (fbpa_stat != 0xFFFFFFFFU) && ((fbpa_stat & 0xFFFF0000U) != 0xBADF0000U) &&
++                (fbio_stat != 0xFFFFFFFFU) && ((fbio_stat & 0xFFFF0000U) != 0xBADF0000U))
 +            {
-+                u32 mask = fbp_stat & 0xFFFU;
-+                u32 active_fbps = 0, bit;
++                u32 full_fbps = 0, bit;
++                int slices_aligned = 1;
 +                for (bit = 0; bit < 12U; bit++)
 +                {
-+                    if ((mask & (1U << bit)) == 0U)
-+                        active_fbps++;
++                    int fbp_active = ((fbp_stat & (1U << bit)) == 0U);
++                    u32 sub      = 0x3U << (2U * bit);
++                    u32 fbpa_off = fbpa_stat & sub;
++                    u32 fbio_off = fbio_stat & sub;
++
++                    if (fbpa_off != fbio_off)
++                        slices_aligned = 0;
++
++                    if (!fbp_active)
++                    {
++                        if ((fbpa_off != sub) || (fbio_off != sub))
++                            slices_aligned = 0;
++                        continue;
++                    }
++
++                    if ((fbpa_off == 0U) && (fbio_off == 0U))
++                        full_fbps++;
 +                }
-+                if (active_fbps > 8U)
++                if (slices_aligned && (full_fbps > 8U))
 +                    return 128U;
 +            }
 +        }
@@ -98,7 +117,7 @@
  static int nv_resize_pcie_bars(struct pci_dev *pci_dev) {
  #if defined(NV_PCI_REBAR_GET_POSSIBLE_SIZES_PRESENT)
      u16 cmd;
-@@ -2087,12 +2174,21 @@
+@@ -2087,12 +2193,21 @@
          !nv_pci_validate_bars(pci_dev, /* only_bar0 = */ NV_FALSE))
          goto err_zero_dev;
  
