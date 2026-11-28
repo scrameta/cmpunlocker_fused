@@ -1,6 +1,6 @@
 --- a/kernel-open/nvidia/nv-pci.c
 +++ b/kernel-open/nvidia/nv-pci.c
-@@ -36,6 +36,744 @@
+@@ -36,6 +36,773 @@
  #include <linux/jiffies.h>
  #include <linux/kernel.h>
  #include <linux/workqueue.h>
@@ -125,10 +125,35 @@
 +    return (cmp_auto != 0) ? 1 : 0;
 +}
 +
++/*
++ * Max Link Speed of the port directly upstream of the GPU (LnkCap[3:0]: 1=Gen1 ..
++ * 4=Gen4, 5=Gen5), or 0 if it cannot be read. Used so every PCIe target
++ * (pre-GSP, post-GSP and the probe-time retrain) is capped by what the host can
++ * actually train, not only by the card's fuses: a Gen4-fused card on a Gen3 host
++ * then takes the Gen3 path end to end.
++ */
++static int cmp170hx_host_max_pcie_gen(unsigned int domain, unsigned int bus,
++                                      unsigned int dev, unsigned int fn)
++{
++    struct pci_dev *gpu, *upstream;
++    u32 lnkcap = 0;
++    int host = 0;
++
++    gpu = NV_GET_DOMAIN_BUS_AND_SLOT(domain, bus, PCI_DEVFN(dev, fn));
++    if (gpu == NULL)
++        return 0;
++    upstream = pci_upstream_bridge(gpu);
++    if ((upstream != NULL) &&
++        (pcie_capability_read_dword(upstream, PCI_EXP_LNKCAP, &lnkcap) == 0))
++        host = (int)(lnkcap & PCI_EXP_LNKCAP_SLS);
++    pci_dev_put(gpu);
++    return host;
++}
++
 +int cmp170hx_want_max_pcie_gen(unsigned int domain, unsigned int bus,
 +                               unsigned int dev, unsigned int fn)
 +{
-+    int gen;
++    int gen, host;
 +
 +    if (!cmp170hx_bdf_matches(domain, bus, dev, fn))
 +        return 2;
@@ -136,6 +161,10 @@
 +        gen = cmp_max_pcie_gen;
 +    else
 +        gen = (cmp_auto != 0) ? 4 : 2;
++    /* Unknown host speed (0) leaves the target uncapped, as before. */
++    host = cmp170hx_host_max_pcie_gen(domain, bus, dev, fn);
++    if ((host > 0) && (gen > host))
++        gen = host;
 +    if (gen < 2)
 +        gen = 2;
 +    if (gen > 4)

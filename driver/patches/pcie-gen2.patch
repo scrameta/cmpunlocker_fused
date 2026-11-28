@@ -295,7 +295,7 @@
          {
 --- a/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c
 +++ b/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c
-@@ -611,6 +611,155 @@
+@@ -611,6 +611,172 @@
          }
      }
  
@@ -352,6 +352,55 @@
 +                              "SEC2_DEBUG: PCIe XVE_OVR late=0x%08x\n",
 +                              GPU_REG_RD32(pGpu, 0x0008872cU));
 +                }
++            }
++            else if (targetGen >= 4U)
++            {
++                /*
++                 * Gen4 target: program the Gen4 PHY state directly. Do NOT run the Gen3
++                 * post-GSP sequence first: it caps LINK_CONFIG_0 at Gen3 (LnkCap max speed
++                 * reads Gen3) and retrains to Gen3 while GSP-RM is starting, so RM caches
++                 * Gen3 as current and max link speed and nvidia-smi reports Gen3 even after
++                 * the probe-time retrain has taken the link to Gen4.
++                 *
++                 * No GSP-side speed change is issued here (and so no XVE_OVR=8 write, which
++                 * the Gen3 path only does after its own speed change): the probe-time staged
++                 * config-space retrain (cmp_pcie_retrain=1) takes the link to Gen4.
++                 * With cmp_pcie_retrain=0 the link stays where training left it (manual retrain).
++                 */
++                NvU32 v;
++
++                /* Target Link Speed (LnkCtl2 mirror) = Gen4, never Gen3. */
++                v = GPU_REG_RD32(pGpu, 0x000880a8U);
++                GPU_REG_WR32(pGpu, 0x000880a8U, (v & ~0xfU) | 4U);
++
++                /*
++                 * Runtime replay of the suppressed A100 DevInit Gen4 PHY-init block ("E1").
++                 * Never writes 0x881C0 (SYSTEM_MAX_SPEED) via SEC2 Booter (causes FECS_PRI_TIMEOUT).
++                 */
++                GPU_REG_WR32(pGpu, 0x00088ce4U, 0x00000014U);
++                v = GPU_REG_RD32(pGpu, 0x00088ce0U);
++                GPU_REG_WR32(pGpu, 0x00088ce0U, (v & ~0x3fU) | 0x06U);
++                v = GPU_REG_RD32(pGpu, 0x0008c2c0U);
++                GPU_REG_WR32(pGpu, 0x0008c2c0U,
++                             v & ~((1U << 0) | (1U << 2) | (1U << 3) | (1U << 13) | (1U << 23)));
++                v = GPU_REG_RD32(pGpu, 0x0008c1c0U);
++                GPU_REG_WR32(pGpu, 0x0008c1c0U, (v & ~0x000f0000U) | (4U << 16));
++                v = GPU_REG_RD32(pGpu, 0x0008c040U);
++                GPU_REG_WR32(pGpu, 0x0008c040U, v & ~0x000c0000U); /* 0 = Gen4 max */
++                v = GPU_REG_RD32(pGpu, 0x00088610U);
++                GPU_REG_WR32(pGpu, 0x00088610U, v | 0x00001001U);
++                v = GPU_REG_RD32(pGpu, 0x0008841cU);
++                v = (v | (1U << 11) | (1U << 13)) &
++                    ~((1U << 12) | (1U << 14) | 0xc0000000U);
++                GPU_REG_WR32(pGpu, 0x0008841cU, v);
++
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG: CMP Gen4 E1 PHY init applied (devId=0x%x MAGIC_D=0x%08x CAP=0x%08x CAP2=0x%08x PL=0x%08x LC0=0x%08x)\n",
++                          lateDevId, magicD,
++                          GPU_REG_RD32(pGpu, 0x00088084U),
++                          GPU_REG_RD32(pGpu, 0x000880a4U),
++                          GPU_REG_RD32(pGpu, 0x0008c1c0U),
++                          GPU_REG_RD32(pGpu, 0x0008c040U));
 +            }
 +            else
 +            {
@@ -412,38 +461,6 @@
 +                          GPU_REG_RD32(pGpu, 0x000880a4U),
 +                          GPU_REG_RD32(pGpu, 0x0008c2c0U),
 +                          GPU_REG_RD32(pGpu, 0x0008c040U));
-+
-+                if (targetGen >= 4U)
-+                {
-+                    /*
-+                     * Runtime replay of the suppressed A100 DevInit Gen4 PHY-init block ("E1").
-+                     * Never writes 0x881C0 (SYSTEM_MAX_SPEED) via SEC2 Booter (causes FECS_PRI_TIMEOUT).
-+                     */
-+                    GPU_REG_WR32(pGpu, 0x00088ce4U, 0x00000014U);
-+                    v = GPU_REG_RD32(pGpu, 0x00088ce0U);
-+                    GPU_REG_WR32(pGpu, 0x00088ce0U, (v & ~0x3fU) | 0x06U);
-+                    v = GPU_REG_RD32(pGpu, 0x0008c2c0U);
-+                    GPU_REG_WR32(pGpu, 0x0008c2c0U,
-+                                 v & ~((1U << 0) | (1U << 2) | (1U << 3) | (1U << 13) | (1U << 23)));
-+                    v = GPU_REG_RD32(pGpu, 0x0008c1c0U);
-+                    GPU_REG_WR32(pGpu, 0x0008c1c0U, (v & ~0x000f0000U) | (4U << 16));
-+                    v = GPU_REG_RD32(pGpu, 0x0008c040U);
-+                    GPU_REG_WR32(pGpu, 0x0008c040U, v & ~0x000c0000U); /* 0 = Gen4 max */
-+                    v = GPU_REG_RD32(pGpu, 0x00088610U);
-+                    GPU_REG_WR32(pGpu, 0x00088610U, v | 0x00001001U);
-+                    v = GPU_REG_RD32(pGpu, 0x0008841cU);
-+                    v = (v | (1U << 11) | (1U << 13)) &
-+                        ~((1U << 12) | (1U << 14) | 0xc0000000U);
-+                    GPU_REG_WR32(pGpu, 0x0008841cU, v);
-+
-+                    NV_PRINTF(LEVEL_ERROR,
-+                              "SEC2_DEBUG: CMP Gen4 E1 PHY init applied (devId=0x%x MAGIC_D=0x%08x CAP=0x%08x CAP2=0x%08x PL=0x%08x LC0=0x%08x)\n",
-+                              lateDevId, magicD,
-+                              GPU_REG_RD32(pGpu, 0x00088084U),
-+                              GPU_REG_RD32(pGpu, 0x000880a4U),
-+                              GPU_REG_RD32(pGpu, 0x0008c1c0U),
-+                              GPU_REG_RD32(pGpu, 0x0008c040U));
-+                }
 +            }
 +        }
 +    }
